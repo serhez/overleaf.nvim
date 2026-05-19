@@ -50,6 +50,28 @@ describe('document', function()
       vim.api.nvim_buf_delete(bufnr, { force = true })
     end)
 
+    it('recovers pending local edits from buffer content', function()
+      local doc = Document.new('test_doc', '/main.tex')
+      doc.joined = true
+      doc.server_content = 'Hello World'
+      doc.content = 'Hello World'
+      doc.pending_ops = { { p = 11, i = '!' } }
+
+      local bufnr = vim.api.nvim_create_buf(true, false)
+      vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { 'Hello World!' })
+      doc.bufnr = bufnr
+
+      local result = doc:check_content({ recover_pending = true })
+      assert.is_true(result)
+      assert.are.equal('Hello World!', doc.content)
+      assert.are.same({
+        { p = 0, d = 'Hello World' },
+        { p = 0, i = 'Hello World!' },
+      }, doc.pending_ops)
+
+      vim.api.nvim_buf_delete(bufnr, { force = true })
+    end)
+
     it('returns true when not joined', function()
       local doc = Document.new('test_doc', '/main.tex')
       doc.joined = false
@@ -184,6 +206,48 @@ describe('document', function()
       doc:submit_op({ { p = 0, i = 'x' } })
 
       assert.is_nil(doc.pending_ops)
+    end)
+  end)
+
+  describe('ack', function()
+    it('clears modified after acknowledged local edit when no pending ops remain', function()
+      local doc = Document.new('test_doc', '/main.tex')
+      doc.version = 5
+      doc.server_content = 'Hello'
+      doc.inflight_op = { { p = 5, i = '!' } }
+
+      local bufnr = vim.api.nvim_create_buf(true, false)
+      vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { 'Hello!' })
+      vim.bo[bufnr].modified = true
+      doc.bufnr = bufnr
+
+      doc:_on_ack()
+
+      assert.are.equal(6, doc.version)
+      assert.are.equal('Hello!', doc.server_content)
+      assert.is_false(vim.bo[bufnr].modified)
+
+      vim.api.nvim_buf_delete(bufnr, { force = true })
+    end)
+
+    it('keeps modified while additional pending ops remain', function()
+      local doc = Document.new('test_doc', '/main.tex')
+      doc.version = 5
+      doc.server_content = 'Hello'
+      doc.inflight_op = { { p = 5, i = '!' } }
+      doc.pending_ops = { { p = 6, i = '?' } }
+      doc.joined = false -- prevent the follow-up flush from consuming pending_ops in this unit test
+
+      local bufnr = vim.api.nvim_create_buf(true, false)
+      vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { 'Hello!?' })
+      vim.bo[bufnr].modified = true
+      doc.bufnr = bufnr
+
+      doc:_on_ack()
+
+      assert.is_true(vim.bo[bufnr].modified)
+
+      vim.api.nvim_buf_delete(bufnr, { force = true })
     end)
   end)
 

@@ -85,8 +85,9 @@ function Document:flush()
   if not self.joined or self._rejoining then return end
   if self.inflight_op or not self.pending_ops then return end
 
-  -- Pre-flight check: verify buffer and doc.content are in sync
-  if not self:check_content() then
+  -- Pre-flight check: verify buffer and doc.content are in sync.
+  -- If the buffer is ahead of our mirror, rebuild the pending op from the buffer.
+  if not self:check_content({ recover_pending = true }) then
     return -- check_content triggers rejoin on mismatch
   end
 
@@ -117,6 +118,10 @@ function Document:_on_ack()
   self.inflight_op = nil
 
   config.log('debug', 'ACK received for %s, now v%d', self.path, self.version)
+
+  if not self.pending_ops and self.bufnr and vim.api.nvim_buf_is_valid(self.bufnr) then
+    vim.bo[self.bufnr].modified = false
+  end
 
   -- Flush next pending if any
   if self.pending_ops then self:flush() end
@@ -176,11 +181,20 @@ function Document:rejoin(attempt)
   end, delay)
 end
 
+local function replace_content_ops(from_content, to_content)
+  local ops = {}
+  if #from_content > 0 then table.insert(ops, { p = 0, d = from_content }) end
+  if #to_content > 0 then table.insert(ops, { p = 0, i = to_content }) end
+  return ops
+end
+
 --- Verify that the buffer content matches doc.content.
---- If they diverge (e.g. due to undo-clear side effects or missed events),
---- rejoin to resync from the server.
+--- If a local pending update exists, recover by rebuilding it from the buffer.
+--- Otherwise, rejoin to resync from the server.
+---@param opts table|nil
 ---@return boolean true if content matches
-function Document:check_content()
+function Document:check_content(opts)
+  opts = opts or {}
   if not self.joined or self._rejoining then return true end
   if not self.bufnr or not vim.api.nvim_buf_is_valid(self.bufnr) then return true end
   if self.applying_remote then return true end
@@ -189,6 +203,19 @@ function Document:check_content()
   local buf_content = table.concat(lines, '\n')
 
   if buf_content ~= self.content then
+    if opts.recover_pending and self.pending_ops and not self.inflight_op then
+      config.log(
+        'debug',
+        'Content divergence detected in %s (buf=%d, doc=%d bytes) — rebuilding pending update',
+        self.path,
+        #buf_content,
+        #self.content
+      )
+      self.content = buf_content
+      self.pending_ops = replace_content_ops(self.server_content or '', buf_content)
+      return true
+    end
+
     config.log(
       'warn',
       'Content divergence detected in %s (buf=%d, doc=%d bytes) — rejoining',
