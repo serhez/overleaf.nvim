@@ -7,9 +7,26 @@ local sync = require('overleaf.sync')
 
 local M = {}
 
+local function resolve_url(base_url, url)
+  if url:match('^https?://') then return url end
+
+  if url:match('^//') then
+    local scheme = base_url:match('^(https?:)') or 'https:'
+    return scheme .. url
+  end
+
+  return base_url:gsub('/+$', '') .. '/' .. url:gsub('^/+', '')
+end
+
 --- Open a file with the configured viewer or platform default
 ---@param file_path string
 local function open_file(file_path)
+  local size = vim.fn.getfsize(file_path)
+  if size <= 0 then
+    config.log('warn', 'Not opening empty or missing file: %s', file_path)
+    return
+  end
+
   local viewer = config.get().pdf_viewer
   if viewer then
     -- User-configured viewer: run as background job to avoid disrupting cursor/window layout
@@ -37,8 +54,36 @@ M._state = {
   documents = {}, -- doc_id -> Document
 }
 
+function M.cleanup_buffers()
+  for _, doc in pairs(M._state.documents) do
+    doc.bufnr = nil
+  end
+
+  for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(bufnr) then
+      local name = vim.api.nvim_buf_get_name(bufnr)
+      if name:match('^overleaf://') or name:match('^canola%-overleaf://') then
+        pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+      end
+    end
+  end
+end
+
+local function setup_autocmds()
+  local group = vim.api.nvim_create_augroup('OverleafNvim', { clear = false })
+  vim.api.nvim_clear_autocmds({ group = group, event = { 'ExitPre', 'VimLeavePre' } })
+  vim.api.nvim_create_autocmd({ 'ExitPre', 'VimLeavePre' }, {
+    group = group,
+    desc = 'Wipe Overleaf virtual buffers before sessions are saved',
+    callback = function()
+      if config.get().cleanup_buffers_on_exit ~= false then M.cleanup_buffers() end
+    end,
+  })
+end
+
 function M.setup(opts)
   config.setup(opts)
+  setup_autocmds()
 
   -- Default keymaps (prefix: <leader>o for Overleaf)
   local keys = opts and opts.keys or true
@@ -47,7 +92,7 @@ function M.setup(opts)
     map('n', '<leader>oc', function() M.connect() end, { desc = 'Overleaf: Connect' })
     map('n', '<leader>od', function() M.disconnect() end, { desc = 'Overleaf: Disconnect' })
     map('n', '<leader>ob', function() M.compile() end, { desc = 'Overleaf: Build (compile)' })
-    map('n', '<leader>ot', function() M.toggle_tree() end, { desc = 'Overleaf: Toggle tree' })
+    map('n', '<leader>ot', function() M.open_explorer() end, { desc = 'Overleaf: Explorer' })
     map('n', '<leader>oo', function() M.select_document() end, { desc = 'Overleaf: Open document' })
     map('n', '<leader>op', function() M.preview_file() end, { desc = 'Overleaf: Preview file' })
     map('n', '<leader>or', function() M.show_comment() end, { desc = 'Overleaf: Read comment' })
@@ -186,10 +231,15 @@ function M._connect_project(cookie, project_id, project_name)
 
     -- Start file sync (if sync_dir configured)
     sync.start(project_name)
-    sync.sync_all(M._state, project._project_tree)
+    require('overleaf.ops').sync_project()
 
-    -- Show tree immediately
-    vim.schedule(function() require('overleaf.tree').toggle() end)
+    -- Show explorer immediately
+    vim.schedule(function() M.open_explorer() end)
+
+    local compile_cfg = config.get().compile or {}
+    if compile_cfg.backend == 'local' and compile_cfg.auto_start_watch == true then
+      require('overleaf.local_compile').start_watch(M._state)
+    end
   end)
 end
 
@@ -515,9 +565,19 @@ function M._rejoin_documents()
   end
 end
 
-function M.open_document(doc_id_or_path, doc_path)
+function M.open_document(doc_id_or_path, doc_path, opts)
+  opts = opts or {}
   local doc_id = doc_id_or_path
   local path = doc_path
+  local target_win = opts.winid or vim.api.nvim_get_current_win()
+
+  local function in_target_window(fn)
+    if target_win and vim.api.nvim_win_is_valid(target_win) then
+      vim.api.nvim_win_call(target_win, fn)
+    else
+      fn()
+    end
+  end
 
   if not path then
     -- Assume it's a path, look up ID
@@ -535,7 +595,7 @@ function M.open_document(doc_id_or_path, doc_path)
   if M._state.documents[doc_id] then
     local existing = M._state.documents[doc_id]
     if existing.bufnr and vim.api.nvim_buf_is_valid(existing.bufnr) then
-      vim.api.nvim_set_current_buf(existing.bufnr)
+      in_target_window(function() vim.api.nvim_set_current_buf(existing.bufnr) end)
       return
     end
   end
@@ -549,7 +609,7 @@ function M.open_document(doc_id_or_path, doc_path)
       return
     end
 
-    buffer.create(doc, lines)
+    in_target_window(function() buffer.create(doc, lines) end)
 
     -- Write to sync dir and start watching for external changes
     sync.write_doc(doc)
@@ -587,7 +647,19 @@ function M.select_document()
   project.select_document(function(doc_id, doc_path) M.open_document(doc_id, doc_path) end)
 end
 
+function M.open_explorer()
+  if not M._state.connected then
+    config.log('warn', 'Not connected. Run :OverleafConnect first.')
+    return
+  end
+  require('overleaf.explorer').open()
+end
+
 function M.toggle_tree()
+  M.open_explorer()
+end
+
+function M.open_native_tree()
   if not M._state.connected then
     config.log('warn', 'Not connected. Run :OverleafConnect first.')
     return
@@ -648,49 +720,13 @@ function M.create_doc(name, parent_folder_id)
     if not doc_name or doc_name == '' then return end
 
     local full_path = prefix .. doc_name
-    if project.path_exists(full_path) then
-      config.log('error', 'File already exists: %s', full_path)
-      return
-    end
-
-    bridge.request('createDoc', {
-      cookie = config.get().cookie,
-      csrfToken = M._state.csrf_token,
-      projectId = M._state.project_id,
-      name = doc_name,
-      parentFolderId = parent_folder_id,
-    }, function(err, result)
+    require('overleaf.ops').create(full_path, 'file', function(err, entry)
       if err then
-        local msg = err.message or ''
-        if msg:match('already exists') or msg:match('400') then
-          config.log('error', 'File already exists: %s', doc_name)
-        else
-          config.log('error', 'Failed to create doc: %s', msg)
-        end
+        config.log('error', 'Failed to create doc: %s', err)
         return
       end
 
-      config.log('info', 'Created: %s', full_path)
-      vim.schedule(function()
-        -- Add to tree from API response
-        local depth = 0
-        if parent_folder_id then
-          for _, e in ipairs(project._project_tree) do
-            if e.id == parent_folder_id then
-              depth = (e.depth or 0) + 1
-              break
-            end
-          end
-        end
-        project.add_entry({
-          id = result._id or result.id,
-          name = doc_name,
-          path = full_path,
-          type = 'doc',
-          depth = depth,
-        })
-        require('overleaf.tree').refresh()
-      end)
+      config.log('info', 'Created: %s', entry and entry.path or full_path)
     end)
   end
 
@@ -713,48 +749,13 @@ function M.create_folder(name, parent_folder_id)
     if not folder_name or folder_name == '' then return end
 
     local full_path = prefix .. folder_name .. '/'
-    if project.path_exists(full_path) then
-      config.log('error', 'Folder already exists: %s', full_path)
-      return
-    end
-
-    bridge.request('createFolder', {
-      cookie = config.get().cookie,
-      csrfToken = M._state.csrf_token,
-      projectId = M._state.project_id,
-      name = folder_name,
-      parentFolderId = parent_folder_id,
-    }, function(err, result)
+    require('overleaf.ops').create(full_path, 'directory', function(err, entry)
       if err then
-        local msg = err.message or ''
-        if msg:match('already exists') or msg:match('400') then
-          config.log('error', 'Folder already exists: %s', folder_name)
-        else
-          config.log('error', 'Failed to create folder: %s', msg)
-        end
+        config.log('error', 'Failed to create folder: %s', err)
         return
       end
 
-      config.log('info', 'Created folder: %s', full_path)
-      vim.schedule(function()
-        local depth = 0
-        if parent_folder_id then
-          for _, e in ipairs(project._project_tree) do
-            if e.id == parent_folder_id then
-              depth = (e.depth or 0) + 1
-              break
-            end
-          end
-        end
-        project.add_entry({
-          id = result._id or result.id,
-          name = folder_name,
-          path = full_path,
-          type = 'folder',
-          depth = depth,
-        })
-        require('overleaf.tree').refresh()
-      end)
+      config.log('info', 'Created folder: %s', entry and entry.path or full_path)
     end)
   end
 
@@ -802,20 +803,12 @@ function M.upload_file(file_path, parent_folder_id)
     local file_name = vim.fn.fnamemodify(path, ':t')
     config.log('info', 'Uploading %s...', file_name)
 
-    bridge.request('uploadFile', {
-      cookie = config.get().cookie,
-      csrfToken = M._state.csrf_token,
-      projectId = M._state.project_id,
-      filePath = path,
-      fileName = file_name,
-      parentFolderId = parent_folder_id,
-    }, function(err, _result)
+    require('overleaf.ops').upload_file(path, parent_folder_id, function(err, entry)
       if err then
-        config.log('error', 'Upload failed: %s', err.message)
+        config.log('error', 'Upload failed: %s', err)
         return
       end
-      config.log('info', 'Uploaded: %s', file_name)
-      -- Tree update happens via reciveNewFile socket event
+      config.log('info', 'Uploaded: %s', entry and entry.path or file_name)
     end)
   end
 
@@ -847,30 +840,15 @@ function M.rename_entity()
     vim.ui.input({ prompt = 'New name for "' .. choice.name .. '": ', default = choice.name }, function(new_name)
       if not new_name or new_name == '' or new_name == choice.name then return end
 
-      bridge.request('renameEntity', {
-        cookie = config.get().cookie,
-        csrfToken = M._state.csrf_token,
-        projectId = M._state.project_id,
-        entityId = choice.id,
-        entityType = choice.type,
-        newName = new_name,
-      }, function(err, _)
+      local dest_path = project.get_parent_path(choice.path) .. new_name
+      if choice.type == 'folder' then dest_path = dest_path .. '/' end
+
+      require('overleaf.ops').rename(choice.path, dest_path, function(err, updated)
         if err then
-          config.log('error', 'Rename failed: %s', err.message)
+          config.log('error', 'Rename failed: %s', err)
           return
         end
-        vim.schedule(function()
-          local updated = project.rename_entry(choice.id, new_name)
-          if updated and choice.type == 'doc' then
-            local doc = M._state.documents[choice.id]
-            if doc and doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then
-              doc.path = updated.path
-              vim.api.nvim_buf_set_name(doc.bufnr, sync.buf_name(updated.path))
-            end
-          end
-          if updated then config.log('info', 'Renamed to: %s', updated.path) end
-          require('overleaf.tree').refresh()
-        end)
+        if updated then config.log('info', 'Renamed to: %s', updated.path) end
       end)
     end)
   end)
@@ -901,22 +879,12 @@ function M.delete_entity()
     vim.ui.input({ prompt = 'Delete "' .. choice.path .. '"? (y/N): ' }, function(answer)
       if answer ~= 'y' and answer ~= 'Y' then return end
 
-      bridge.request('deleteEntity', {
-        cookie = config.get().cookie,
-        csrfToken = M._state.csrf_token,
-        projectId = M._state.project_id,
-        entityId = choice.id,
-        entityType = choice.type,
-      }, function(err, _)
+      require('overleaf.ops').delete(choice.path, function(err)
         if err then
-          config.log('error', 'Delete failed: %s', err.message)
+          config.log('error', 'Delete failed: %s', err)
           return
         end
         config.log('info', 'Deleted: %s', choice.path)
-        vim.schedule(function()
-          project.remove_entry(choice.id)
-          require('overleaf.tree').refresh()
-        end)
       end)
     end)
   end)
@@ -991,6 +959,12 @@ function M.compile()
     return
   end
 
+  local compile_cfg = config.get().compile or {}
+  if compile_cfg.backend == 'local' then
+    M.compile_local()
+    return
+  end
+
   config.log('info', 'Compiling...')
 
   bridge.request('compile', {
@@ -1015,6 +989,32 @@ function M.compile()
   end)
 end
 
+function M.compile_local()
+  config.log('info', 'Compiling locally...')
+
+  require('overleaf.local_compile').compile(M._state, function(err, result)
+    if err then
+      config.log('error', 'Local compile failed: %s', err.message)
+      vim.schedule(function() M._parse_compile_log(err.log or '') end)
+      return
+    end
+
+    config.log('info', 'Local compile succeeded')
+    vim.schedule(function()
+      M._parse_compile_log(result.log or '')
+      require('overleaf.local_compile').open_pdf(result.pdf_path)
+    end)
+  end)
+end
+
+function M.compile_watch()
+  require('overleaf.local_compile').start_watch(M._state)
+end
+
+function M.stop_compile_watch()
+  require('overleaf.local_compile').stop_watch()
+end
+
 function M._open_pdf(output_files)
   local pdf_file = nil
   for _, f in ipairs(output_files) do
@@ -1025,14 +1025,17 @@ function M._open_pdf(output_files)
   end
   if not pdf_file or not pdf_file.url then return end
 
+  local pdf_url = resolve_url(config.get().base_url, pdf_file.url)
+  config.log('debug', 'Downloading PDF from %s', pdf_url)
+
   bridge.request('downloadUrl', {
     cookie = config.get().cookie,
-    url = config.get().base_url .. pdf_file.url,
+    url = pdf_url,
     fileName = (M._state.project_name or 'output') .. '.pdf',
     outputDir = config.get().pdf_dir,
   }, function(err, result)
     if err then
-      config.log('debug', 'PDF download failed: %s', err.message)
+      config.log('warn', 'PDF download failed from %s: %s', pdf_url, err.message)
       return
     end
     vim.schedule(function() open_file(result.path) end)
@@ -1409,6 +1412,8 @@ function M.disconnect()
     M._reconnect.timer = nil
   end
   bridge._on_unexpected_exit = nil
+
+  pcall(function() require('overleaf.local_compile').stop_watch({ silent = true }) end)
 
   -- Stop file sync watchers
   sync.stop()

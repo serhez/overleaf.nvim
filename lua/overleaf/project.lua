@@ -114,6 +114,56 @@ function M.get_doc_by_path(path)
   return nil
 end
 
+function M.get_entry_by_id(entity_id)
+  for _, entry in ipairs(M._project_tree) do
+    if entry.id == entity_id then return entry end
+  end
+  return nil
+end
+
+function M.get_entry_by_path(path)
+  for _, entry in ipairs(M._project_tree) do
+    if entry.path == path then return entry end
+  end
+  return nil
+end
+
+function M.get_parent_path(path)
+  if path:sub(-1) == '/' then path = path:sub(1, -2) end
+  return path:match('^(.*/)') or ''
+end
+
+function M.get_parent_folder_id(path)
+  local parent_path = M.get_parent_path(path)
+  if parent_path == '' then return nil end
+  for _, entry in ipairs(M._project_tree) do
+    if entry.type == 'folder' and entry.path == parent_path then return entry.id end
+  end
+  return nil
+end
+
+function M.get_depth_for_parent(parent_folder_id)
+  if not parent_folder_id then return 0 end
+  for _, entry in ipairs(M._project_tree) do
+    if entry.id == parent_folder_id and entry.type == 'folder' then return (entry.depth or 0) + 1 end
+  end
+  return 0
+end
+
+function M.direct_children(parent_path)
+  local children = {}
+  for _, entry in ipairs(M._project_tree) do
+    if M.get_parent_path(entry.path) == parent_path then table.insert(children, entry) end
+  end
+  table.sort(children, function(a, b)
+    if a.type == b.type then return a.name < b.name end
+    if a.type == 'folder' then return true end
+    if b.type == 'folder' then return false end
+    return a.type < b.type
+  end)
+  return children
+end
+
 --- Check if a path already exists in the tree
 function M.path_exists(path)
   for _, entry in ipairs(M._project_tree) do
@@ -125,7 +175,7 @@ end
 --- Add an entry to the tree (for after API create calls), dedup by ID
 function M.add_entry(entry)
   for _, existing in ipairs(M._project_tree) do
-    if existing.id == entry.id then
+    if existing.id == entry.id or existing.path == entry.path then
       return false -- already exists
     end
   end
@@ -181,6 +231,22 @@ function M.remove_entry(entity_id)
     end
   end
   return false
+end
+
+function M.remove_entry_tree(entity_id)
+  local target = M.get_entry_by_id(entity_id)
+  if not target then return {} end
+
+  local removed = {}
+  local prefix = target.type == 'folder' and target.path or nil
+  for i = #M._project_tree, 1, -1 do
+    local entry = M._project_tree[i]
+    if entry.id == entity_id or (prefix and entry.path:sub(1, #prefix) == prefix) then
+      table.insert(removed, 1, entry)
+      table.remove(M._project_tree, i)
+    end
+  end
+  return removed
 end
 
 --- Get the path prefix for a parent folder

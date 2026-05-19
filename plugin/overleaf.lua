@@ -2,8 +2,20 @@
 local subcommands = {
   connect = function() require('overleaf').connect() end,
   disconnect = function() require('overleaf').disconnect() end,
-  compile = function() require('overleaf').compile() end,
-  tree = function() require('overleaf').toggle_tree() end,
+  compile = function(args)
+    if args == 'watch' then
+      require('overleaf').compile_watch()
+    elseif args == 'stop' then
+      require('overleaf').stop_compile_watch()
+    elseif args == 'local' then
+      require('overleaf').compile_local()
+    else
+      require('overleaf').compile()
+    end
+  end,
+  explorer = function() require('overleaf').open_explorer() end,
+  tree = function() require('overleaf').open_explorer() end,
+  native_tree = function() require('overleaf').open_native_tree() end,
   open = function(args) require('overleaf').open_document(args) end,
   projects = function() require('overleaf').select_project() end,
   status = function() require('overleaf').status() end,
@@ -75,6 +87,7 @@ end, {
     -- Complete subcommand arguments
     local sub = parts[2]
     if sub == 'comments' then return { 'refresh' } end
+    if sub == 'compile' then return { 'local', 'watch', 'stop' } end
     if sub == 'sync' then return { 'import', 'export' } end
     return {}
   end,

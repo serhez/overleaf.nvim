@@ -19,6 +19,18 @@ describe('config', function()
     it('has node_path defaulting to node', function() assert.are.equal('node', config.get().node_path) end)
 
     it('has log_level defaulting to info', function() assert.are.equal('info', config.get().log_level) end)
+
+    it('has explorer defaulting to native', function() assert.are.equal('native', config.get().explorer) end)
+
+    it('uses Overleaf compile backend by default', function()
+      assert.are.equal('overleaf', config.get().compile.backend)
+      assert.is_true(config.get().compile.open_pdf)
+    end)
+
+    it(
+      'cleans up virtual buffers on exit by default',
+      function() assert.is_true(config.get().cleanup_buffers_on_exit) end
+    )
   end)
 
   describe('setup', function()
@@ -30,6 +42,23 @@ describe('config', function()
     it('overrides pdf_viewer', function()
       config.setup({ pdf_viewer = 'zathura' })
       assert.are.equal('zathura', config.get().pdf_viewer)
+    end)
+
+    it('overrides explorer', function()
+      config.setup({ explorer = 'canola' })
+      assert.are.equal('canola', config.get().explorer)
+    end)
+
+    it('overrides cleanup_buffers_on_exit', function()
+      config.setup({ cleanup_buffers_on_exit = false })
+      assert.is_false(config.get().cleanup_buffers_on_exit)
+    end)
+
+    it('merges compile config without dropping defaults', function()
+      config.setup({ compile = { backend = 'local', main_file = 'paper.tex' } })
+      assert.are.equal('local', config.get().compile.backend)
+      assert.are.equal('paper.tex', config.get().compile.main_file)
+      assert.is_true(config.get().compile.open_pdf)
     end)
 
     it('preserves unset fields', function()

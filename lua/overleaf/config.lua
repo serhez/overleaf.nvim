@@ -7,15 +7,34 @@ M._config = {
   base_url = 'https://www.overleaf.com', -- Overleaf instance URL (for self-hosted)
   pdf_viewer = nil, -- PDF viewer command (nil = auto-detect: 'open' on macOS, 'xdg-open' on Linux)
   pdf_dir = nil, -- PDF output directory (nil = system temp dir)
+  compile = {
+    backend = 'overleaf', -- 'overleaf' or 'local'
+    main_file = nil, -- Main tex file for local compilation (nil = infer from Overleaf project)
+    local_command = nil, -- Command/table for one-shot local compile; {main} is replaced with main_file
+    local_watch_command = nil, -- Command/table for live local compile watch; {main} is replaced with main_file
+    open_pdf = true, -- Open PDF after successful local compile / watch start
+    auto_start_watch = false, -- Start local latexmk -pvc after connecting when backend='local'
+    watch_log = false, -- Log latexmk -pvc output at debug level
+  },
   sync_dir = nil, -- Local file sync directory (nil = disabled; enables external tool integration)
+  explorer = 'native', -- 'native' or 'canola'
+  cleanup_buffers_on_exit = true, -- Wipe overleaf:// buffers before exit so sessions don't restore dead buffers
   log_level = 'info', -- 'debug', 'info', 'warn', 'error'
 }
 
+local function merge(dst, src)
+  for k, v in pairs(src) do
+    if type(v) == 'table' and type(dst[k]) == 'table' then
+      merge(dst[k], v)
+    else
+      dst[k] = v
+    end
+  end
+end
+
 function M.setup(opts)
   if opts then
-    for k, v in pairs(opts) do
-      M._config[k] = v
-    end
+    merge(M._config, opts)
   end
 end
 

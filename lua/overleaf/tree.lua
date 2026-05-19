@@ -182,24 +182,12 @@ function M._delete_entry()
 
   vim.ui.input({ prompt = 'Delete "' .. entry.path .. '"? (y/N): ' }, function(answer)
     if answer ~= 'y' and answer ~= 'Y' then return end
-    local ol = require('overleaf')
-    local bridge = require('overleaf.bridge')
-    bridge.request('deleteEntity', {
-      cookie = require('overleaf.config').get().cookie,
-      csrfToken = ol._state.csrf_token,
-      projectId = ol._state.project_id,
-      entityId = entry.id,
-      entityType = entry.type,
-    }, function(err, _)
+    require('overleaf.ops').delete(entry.path, function(err)
       if err then
-        config.log('error', 'Delete failed: %s', err.message)
+        config.log('error', 'Delete failed: %s', err)
         return
       end
       config.log('info', 'Deleted: %s', entry.path)
-      vim.schedule(function()
-        project.remove_entry(entry.id)
-        M.refresh()
-      end)
     end)
   end)
 end
@@ -218,35 +206,16 @@ function M._rename_entry()
 
   vim.ui.input({ prompt = 'Rename "' .. entry.name .. '" to: ', default = entry.name }, function(new_name)
     if not new_name or new_name == '' or new_name == entry.name then return end
-    local ol = require('overleaf')
-    local bridge = require('overleaf.bridge')
-    bridge.request('renameEntity', {
-      cookie = require('overleaf.config').get().cookie,
-      csrfToken = ol._state.csrf_token,
-      projectId = ol._state.project_id,
-      entityId = entry.id,
-      entityType = entry.type,
-      newName = new_name,
-    }, function(err, _)
+
+    local dest_path = project.get_parent_path(entry.path) .. new_name
+    if entry.type == 'folder' then dest_path = dest_path .. '/' end
+
+    require('overleaf.ops').rename(entry.path, dest_path, function(err, updated)
       if err then
-        config.log('error', 'Rename failed: %s', err.message)
+        config.log('error', 'Rename failed: %s', err)
         return
       end
-      vim.schedule(function()
-        local updated = project.rename_entry(entry.id, new_name)
-        if updated then
-          -- Update open buffer name if it's a doc
-          if entry.type == 'doc' then
-            local doc = ol._state.documents[entry.id]
-            if doc and doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then
-              doc.path = updated.path
-              vim.api.nvim_buf_set_name(doc.bufnr, require('overleaf.sync').buf_name(updated.path))
-            end
-          end
-          config.log('info', 'Renamed to: %s', updated.path)
-        end
-        M.refresh()
-      end)
+      if updated then config.log('info', 'Renamed to: %s', updated.path) end
     end)
   end)
 end

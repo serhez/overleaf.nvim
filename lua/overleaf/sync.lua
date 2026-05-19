@@ -10,6 +10,10 @@ M._watchers = {} -- path -> {handle, doc_id}
 M._write_timers = {} -- doc_id -> timer
 M._writing = {} -- path -> true (suppress watcher during our writes)
 
+--- Get the active sync directory.
+---@return string|nil
+function M.dir() return M._sync_dir end
+
 --- Start sync for a project. Creates the sync directory.
 ---@param project_name string
 function M.start(project_name)
@@ -52,12 +56,10 @@ function M.file_path(doc_path)
   return M._sync_dir .. '/' .. doc_path
 end
 
---- Get the buffer name for a document.
---- Returns the real file path when sync_dir is enabled, otherwise overleaf:// URI.
+--- Get the live buffer name for a document.
 ---@param doc_path string Overleaf document path
 ---@return string
 function M.buf_name(doc_path)
-  if M._sync_dir then return M._sync_dir .. '/' .. doc_path end
   return 'overleaf://' .. doc_path
 end
 

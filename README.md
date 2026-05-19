@@ -99,7 +99,9 @@ To get the cookie manually: open overleaf.com in your browser → DevTools (F12)
 | `:Overleaf connect` | Connect to Overleaf |
 | `:Overleaf disconnect` | Disconnect |
 | `:Overleaf compile` | Compile LaTeX project |
-| `:Overleaf tree` | Toggle file tree |
+| `:Overleaf explorer` | Open the configured explorer |
+| `:Overleaf tree` | Alias for `:Overleaf explorer` |
+| `:Overleaf native_tree` | Open the built-in tree |
 | `:Overleaf open` | Open a document |
 | `:Overleaf projects` | Switch project |
 | `:Overleaf status` | Show connection status |
@@ -124,7 +126,7 @@ To get the cookie manually: open overleaf.com in your browser → DevTools (F12)
 | `<leader>oc` | Connect |
 | `<leader>od` | Disconnect |
 | `<leader>ob` | Build (compile) |
-| `<leader>ot` | Toggle file tree |
+| `<leader>ot` | Open explorer |
 | `<leader>oo` | Open document picker |
 | `<leader>op` | Preview file |
 | `<leader>or` | Read comment at cursor |
@@ -132,7 +134,7 @@ To get the cookie manually: open overleaf.com in your browser → DevTools (F12)
 | `<leader>ox` | Resolve/reopen comment |
 | `<leader>of` | Find in project (search) |
 
-### Tree Keymaps
+### Native Tree Keymaps
 
 | Key | Description |
 |-----|-------------|
@@ -165,6 +167,25 @@ require('overleaf').setup({
   -- When set, all documents are mirrored to disk and external changes are synced back.
   sync_dir = '~/.overleaf',
 
+  -- File explorer integration: 'native' or 'canola' (default: 'native')
+  -- The canola explorer requires sync_dir.
+  explorer = 'native',
+
+  -- Wipe overleaf:// and canola-overleaf:// buffers before Neovim exits.
+  -- This prevents session managers from restoring inert virtual buffers.
+  cleanup_buffers_on_exit = true,
+
+  -- Compilation backend. The default uses Overleaf's server-side compiler.
+  -- Use backend='local' to compile from sync_dir with latexmk.
+  compile = {
+    backend = 'overleaf', -- 'overleaf' or 'local'
+    main_file = nil, -- nil = infer from Overleaf root doc, main.tex, or first .tex file
+    local_command = nil, -- default: latexmk -pdf -interaction=nonstopmode -synctex=1 {main}
+    local_watch_command = nil, -- default: latexmk -pdf -pvc -interaction=nonstopmode -synctex=1 {main}
+    open_pdf = true,
+    auto_start_watch = false,
+  },
+
   -- Set to false to disable default keymaps
   keys = true,
 })
@@ -173,10 +194,60 @@ require('overleaf').setup({
 ## Workflow
 
 1. `:Overleaf` — authenticate and select a project
-2. File tree appears — press `Enter` to open a document
+2. File explorer appears — press `Enter` to open a document
 3. Edit normally — changes sync to Overleaf in real-time
 4. `:w` — triggers compile and opens PDF
-5. `:Overleaf tree` — switch between documents
+5. `:Overleaf explorer` — browse the project
+
+## Local Compilation
+
+Overleaf compilation remains the default because it matches the cloud environment exactly. For faster local feedback and PDF viewers that auto-reload, enable local compilation from the synced project directory:
+
+```lua
+require('overleaf').setup({
+  sync_dir = '~/.overleaf',
+  compile = {
+    backend = 'local',
+    main_file = 'main.tex', -- optional; inferred when omitted
+  },
+})
+```
+
+With `backend = 'local'`, `:w` and `:Overleaf compile` run:
+
+```sh
+latexmk -pdf -interaction=nonstopmode -synctex=1 <main-file>
+```
+
+You can override the command with a list or shell string. Use `{main}` as a placeholder if the main file should appear somewhere other than the end:
+
+```lua
+compile = {
+  backend = 'local',
+  local_command = { 'latexmk', '-lualatex', '-interaction=nonstopmode', '-synctex=1', '{main}' },
+}
+```
+
+For live PDF refresh, run:
+
+```vim
+:Overleaf compile watch
+```
+
+This starts `latexmk -pvc` in the sync directory and opens the generated PDF once. Use a PDF viewer that auto-reloads changed files, such as Skim, sioyek, Zathura, or Okular. Stop the watcher with:
+
+```vim
+:Overleaf compile stop
+```
+
+To start the watcher automatically after connecting:
+
+```lua
+compile = {
+  backend = 'local',
+  auto_start_watch = true,
+}
+```
 
 ## External Tool Integration (Claude Code, etc.)
 
@@ -190,7 +261,7 @@ require('overleaf').setup({
 })
 ```
 
-When connected to a project, all text documents are synced to `~/.overleaf/<project-name>/`. External tools can read and edit these files — changes are automatically detected and synced back to Overleaf.
+When connected to a project, all text documents are synced to `~/.overleaf/<project-name>/`. External tools can read and edit these files — changes are automatically detected and synced back to Overleaf. Neovim still edits live `overleaf://` buffers so collaborator updates, cursors, comments, and OT synchronization continue to work normally.
 
 ### How it works
 
@@ -206,6 +277,21 @@ When connected to a project, all text documents are synced to `~/.overleaf/<proj
 - `:Overleaf sync` — re-sync all documents (fetch from Overleaf and write to disk)
 - `:Overleaf sync import` — import all external disk changes to Overleaf
 - `:Overleaf sync export` — export all documents to disk
+
+### Canola explorer
+
+Set `explorer = 'canola'` and `sync_dir` to browse the active Overleaf project with canola.nvim:
+
+```lua
+require('overleaf').setup({
+  sync_dir = '~/.overleaf',
+  explorer = 'canola',
+})
+```
+
+`:Overleaf explorer` opens a `canola-overleaf://` project view. Selecting a text document opens the live Overleaf document buffer, while file refs are opened from the local mirror. Creating, deleting, and same-folder renaming in that view call the corresponding Overleaf project operations, then refresh the local mirror. Canola refreshes also re-run the Overleaf sync before rendering.
+
+Oil and snacks.explorer adapters are not implemented yet.
 
 ### Usage with Claude Code
 
