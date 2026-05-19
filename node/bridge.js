@@ -2,6 +2,10 @@
 'use strict';
 
 const readline = require('readline');
+const fs = require('fs');
+const http = require('http');
+const https = require('https');
+const path = require('path');
 const auth = require('./auth');
 const SocketManager = require('./socket');
 const { getOverleafCookie, listProfiles } = require('./chrome-cookie');
@@ -11,6 +15,7 @@ const origLog = console.log;
 console.log = (...args) => console.error('[bridge]', ...args);
 
 const BASE_URL = process.env.OVERLEAF_URL || 'https://www.overleaf.com';
+const BASE_ORIGIN = new URL(BASE_URL).origin;
 
 let requestId = 0;
 let socketManager = null;
@@ -31,6 +36,126 @@ function sendError(id, code, message) {
 
 function sendEvent(event, data) {
   send({ event, data });
+}
+
+function headersForUrl(parsed, cookie) {
+  const headers = { 'User-Agent': 'overleaf-neovim/0.1' };
+  if (cookie && parsed.origin === BASE_ORIGIN) {
+    headers.Cookie = cookie;
+  }
+  return headers;
+}
+
+function resolveUrl(url) {
+  return new URL(url, BASE_URL).toString();
+}
+
+function clsiZoneFromServerId(clsiServerId) {
+  if (!clsiServerId || typeof clsiServerId !== 'string') return null;
+
+  const parts = clsiServerId.split('-').filter(Boolean);
+  return parts[4] || parts[parts.length - 1] || null;
+}
+
+function normalizeDownloadDomain(domain) {
+  if (!domain || typeof domain !== 'string') return null;
+  const withScheme = domain.match(/^https?:\/\//) ? domain : `https://${domain}`;
+  return withScheme.replace(/\/+$/, '');
+}
+
+function addCompileOutputParams(downloadUrl, compileResponse) {
+  if (compileResponse.compileGroup) {
+    downloadUrl.searchParams.set('compileGroup', compileResponse.compileGroup);
+  }
+  downloadUrl.searchParams.set('clsiserverid', compileResponse.clsiServerId);
+  downloadUrl.searchParams.set('enable_pdf_caching', 'true');
+  return downloadUrl.toString();
+}
+
+function resolveOutputFileUrl(fileUrl, compileResponse) {
+  if (!fileUrl) return fileUrl;
+
+  const resolved = new URL(fileUrl, BASE_URL);
+  const downloadDomain = normalizeDownloadDomain(compileResponse.pdfDownloadDomain);
+  const clsiServerId = compileResponse.clsiServerId;
+  const zone = clsiZoneFromServerId(clsiServerId);
+
+  if (downloadDomain && clsiServerId && zone) {
+    const base = new URL(downloadDomain);
+
+    if (resolved.pathname.startsWith('/zone/')) {
+      const downloadUrl = new URL(`${base.origin}${resolved.pathname}${resolved.search}`);
+      return addCompileOutputParams(downloadUrl, compileResponse);
+    }
+
+    if (resolved.pathname.startsWith('/project/')) {
+      const basePath = base.pathname.replace(/\/+$/, '');
+      const zonePrefix = `/zone/${encodeURIComponent(zone)}`;
+      const prefix = basePath.endsWith(zonePrefix) ? basePath : `${basePath}${zonePrefix}`;
+      const downloadUrl = new URL(`${base.origin}${prefix}${resolved.pathname}${resolved.search}`);
+      return addCompileOutputParams(downloadUrl, compileResponse);
+    }
+  }
+
+  return resolved.toString();
+}
+
+function resolveOutputFiles(outputFiles, compileResponse) {
+  return (outputFiles || []).map((file) => ({
+    ...file,
+    url: resolveOutputFileUrl(file.url, compileResponse),
+  }));
+}
+
+async function downloadToFile(url, cookie, filePath, redirectCount = 0) {
+  if (redirectCount > 5) {
+    throw { code: 'TOO_MANY_REDIRECTS', message: 'Too many redirects while downloading file' };
+  }
+
+  const parsed = new URL(url);
+  const httpModule = parsed.protocol === 'http:' ? http : https;
+
+  return await new Promise((resolve, reject) => {
+    const req = httpModule.get({
+      hostname: parsed.hostname,
+      port: parsed.port || (parsed.protocol === 'http:' ? 80 : 443),
+      path: parsed.pathname + parsed.search,
+      headers: headersForUrl(parsed, cookie),
+    }, (res) => {
+      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+        res.resume();
+        const redirectedUrl = new URL(res.headers.location, url).toString();
+        downloadToFile(redirectedUrl, cookie, filePath, redirectCount + 1).then(resolve, reject);
+        return;
+      }
+
+      if (res.statusCode !== 200) {
+        res.resume();
+        reject({ code: 'DOWNLOAD_FAILED', message: `Download failed with status ${res.statusCode} for ${url}` });
+        return;
+      }
+
+      let bytes = 0;
+      const ws = fs.createWriteStream(filePath);
+
+      res.on('data', (chunk) => {
+        bytes += chunk.length;
+      });
+      res.on('error', reject);
+      ws.on('error', reject);
+      ws.on('close', () => {
+        if (bytes === 0) {
+          reject({ code: 'EMPTY_DOWNLOAD', message: `Downloaded file is empty for ${url}` });
+        } else {
+          resolve({ bytes });
+        }
+      });
+      res.pipe(ws);
+    });
+
+    req.on('error', reject);
+    req.setTimeout(30000, () => req.destroy(new Error('Download timeout')));
+  });
 }
 
 const handlers = {
@@ -115,16 +240,17 @@ const handlers = {
 
     const parsed = JSON.parse(compileRes.body);
 
+    const outputFiles = resolveOutputFiles(parsed.outputFiles || [], parsed);
+
     // Download log if available
-    const logFile = (parsed.outputFiles || []).find(f => f.path === 'output.log');
+    const logFile = outputFiles.find(f => f.path === 'output.log');
     let log = '';
     if (logFile) {
-      const logUrl = `${BASE_URL}${logFile.url}`;
-      const logRes = await auth.httpGet(logUrl, cookie);
+      const logRes = await auth.httpGet(logFile.url, cookie);
       log = logRes.body;
     }
 
-    return { status: parsed.status, outputFiles: parsed.outputFiles || [], log };
+    return { status: parsed.status, outputFiles, log };
   },
 
   async downloadUrl(params) {
@@ -134,27 +260,16 @@ const handlers = {
     }
 
     const dir = outputDir || require('os').tmpdir();
-    const fs = require('fs');
     fs.mkdirSync(dir, { recursive: true });
-    const tmpPath = require('path').join(dir, 'overleaf_' + (fileName || 'download'));
+    const tmpPath = path.join(dir, 'overleaf_' + (fileName || 'download'));
 
-    await new Promise((resolve, reject) => {
-      const parsed = new URL(url);
-      const httpModule = parsed.protocol === 'http:' ? require('http') : require('https');
-      httpModule.get({
-        hostname: parsed.hostname,
-        port: parsed.port || (parsed.protocol === 'http:' ? 80 : 443),
-        path: parsed.pathname + parsed.search,
-        headers: { 'Cookie': cookie },
-      }, (res) => {
-        const ws = fs.createWriteStream(tmpPath);
-        res.pipe(ws);
-        ws.on('finish', () => { ws.close(); resolve(); });
-        ws.on('error', reject);
-      }).on('error', reject);
-    });
+    try {
+      fs.rmSync(tmpPath, { force: true });
+    } catch (_) {}
 
-    return { path: tmpPath };
+    const result = await downloadToFile(url, cookie, tmpPath);
+
+    return { path: tmpPath, bytes: result.bytes };
   },
 
   async downloadFile(params) {
@@ -167,38 +282,16 @@ const handlers = {
     const dir = outputDir || require('os').tmpdir();
 
     // Download binary file
-    const fs = require('fs');
     fs.mkdirSync(dir, { recursive: true });
-    const tmpPath = require('path').join(dir, 'overleaf_' + (fileName || fileId));
-    await new Promise((resolve, reject) => {
-      const parsed = new URL(url);
-      const httpModule = parsed.protocol === 'http:' ? require('http') : require('https');
-      httpModule.get({
-        hostname: parsed.hostname,
-        port: parsed.port || (parsed.protocol === 'http:' ? 80 : 443),
-        path: parsed.pathname,
-        headers: { 'Cookie': cookie },
-      }, (res) => {
-        if (res.statusCode === 302 && res.headers.location) {
-          // Follow redirect
-          const redirectParsed = new URL(res.headers.location);
-          const redirectModule = redirectParsed.protocol === 'http:' ? require('http') : require('https');
-          redirectModule.get(res.headers.location, { headers: { 'Cookie': cookie } }, (res2) => {
-            const ws = fs.createWriteStream(tmpPath);
-            res2.pipe(ws);
-            ws.on('finish', () => { ws.close(); resolve(); });
-            ws.on('error', reject);
-          }).on('error', reject);
-        } else {
-          const ws = fs.createWriteStream(tmpPath);
-          res.pipe(ws);
-          ws.on('finish', () => { ws.close(); resolve(); });
-          ws.on('error', reject);
-        }
-      }).on('error', reject);
-    });
+    const tmpPath = path.join(dir, 'overleaf_' + (fileName || fileId));
 
-    return { path: tmpPath };
+    try {
+      fs.rmSync(tmpPath, { force: true });
+    } catch (_) {}
+
+    const result = await downloadToFile(url, cookie, tmpPath);
+
+    return { path: tmpPath, bytes: result.bytes };
   },
 
   async createDoc(params) {

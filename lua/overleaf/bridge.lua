@@ -9,6 +9,17 @@ M._event_handlers = {} -- event_name -> handler[]
 M._buffer = ''
 M._started = false
 M._on_unexpected_exit = nil -- callback for auto-reconnect
+M._stderr_tail = {}
+
+local function remember_stderr(line)
+  table.insert(M._stderr_tail, line)
+  if #M._stderr_tail > 12 then table.remove(M._stderr_tail, 1) end
+end
+
+local function exit_message()
+  if #M._stderr_tail == 0 then return 'Bridge process exited' end
+  return 'Bridge process exited: ' .. table.concat(M._stderr_tail, '\n')
+end
 
 function M.start(callback)
   if M._job_id then
@@ -18,6 +29,7 @@ function M.start(callback)
 
   local script = config.bridge_script()
   local node = config.get().node_path
+  M._stderr_tail = {}
 
   -- Pass base_url to bridge as OVERLEAF_URL environment variable
   local env = nil
@@ -29,7 +41,10 @@ function M.start(callback)
     on_stdout = function(_, data, _) M._on_stdout(data) end,
     on_stderr = function(_, data, _)
       for _, line in ipairs(data) do
-        if line ~= '' then config.log('debug', 'bridge: %s', line) end
+        if line ~= '' then
+          remember_stderr(line)
+          config.log('debug', 'bridge: %s', line)
+        end
       end
     end,
     on_exit = function(_, code, _)
@@ -42,7 +57,7 @@ function M.start(callback)
         if pending.timer then vim.fn.timer_stop(pending.timer) end
         if pending.callback then
           vim.schedule(
-            function() pending.callback({ code = 'BRIDGE_DIED', message = 'Bridge process exited' }, nil) end
+            function() pending.callback({ code = 'BRIDGE_DIED', message = exit_message() }, nil) end
           )
         end
       end

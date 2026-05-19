@@ -280,6 +280,82 @@ function createServer(port) {
       return;
     }
 
+    if (url.pathname.match(/^\/project\/test_project(_domain_zone|_path_zone)?\/compile$/) && req.method === 'POST') {
+      const origin = `http://${req.headers.host}`;
+      const projectId = url.pathname.split('/')[2];
+      const hasDomainZone = projectId === 'test_project_domain_zone';
+      const hasPathZone = projectId === 'test_project_path_zone';
+      const outputPath = `/project/${projectId}/user/user1/build/build1/output`;
+      const outputUrlPrefix = hasPathZone ? `/zone/zonea${outputPath}` : outputPath;
+      const body = JSON.stringify({
+        status: 'success',
+        compileGroup: 'standard',
+        clsiServerId: 'one-two-three-four-zonea',
+        pdfDownloadDomain: hasDomainZone ? `${origin}/zone/zonea` : origin,
+        outputFiles: [
+          {
+            path: 'output.pdf',
+            url: `${outputUrlPrefix}/output.pdf`,
+          },
+          {
+            path: 'output.log',
+            url: `${outputUrlPrefix}/output.log`,
+          },
+        ],
+      });
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+      });
+      res.end(body);
+      return;
+    }
+
+    if (url.pathname.match(/^\/zone\/zonea\/project\/test_project(_domain_zone|_path_zone)?\/user\/user1\/build\/build1\/output\/output\.pdf$/)) {
+      const body = Buffer.from('%PDF-1.4\ncompiled pdf\n%%EOF\n');
+      res.writeHead(200, {
+        'Content-Type': 'application/pdf',
+        'Content-Length': body.length,
+      });
+      res.end(body);
+      return;
+    }
+
+    if (url.pathname.match(/^\/zone\/zonea\/project\/test_project(_domain_zone|_path_zone)?\/user\/user1\/build\/build1\/output\/output\.log$/)) {
+      const body = 'mock compile log\n';
+      res.writeHead(200, {
+        'Content-Type': 'text/plain',
+        'Content-Length': Buffer.byteLength(body),
+      });
+      res.end(body);
+      return;
+    }
+
+    if (url.pathname === '/download/redirect-pdf') {
+      res.writeHead(302, { Location: '/download/pdf' });
+      res.end();
+      return;
+    }
+
+    if (url.pathname === '/download/pdf') {
+      const body = Buffer.from('%PDF-1.4\nmock pdf\n%%EOF\n');
+      res.writeHead(200, {
+        'Content-Type': 'application/pdf',
+        'Content-Length': body.length,
+      });
+      res.end(body);
+      return;
+    }
+
+    if (url.pathname === '/download/empty') {
+      res.writeHead(200, {
+        'Content-Type': 'application/pdf',
+        'Content-Length': 0,
+      });
+      res.end();
+      return;
+    }
+
     res.writeHead(404);
     res.end('Not found');
   });

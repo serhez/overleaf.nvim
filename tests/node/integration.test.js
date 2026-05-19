@@ -13,6 +13,8 @@
 
 const { spawn } = require('child_process');
 const path = require('path');
+const fs = require('fs');
+const os = require('os');
 const crypto = require('crypto');
 const { createServer, getOrCreateDoc, resetDocs, broadcastEvent, simulateRestore } = require('./mock-server');
 
@@ -202,6 +204,84 @@ async function runTests() {
     assert(result.project, 'should receive project data');
     assertEqual(result.project.name, 'Test Project', 'project name');
     assertEqual(result.permissionsLevel, 'owner', 'permissions');
+  });
+
+  await test('compile rewrites cached output URLs', async () => {
+    const result = await bridge.request('compile', {
+      cookie: 'mock_session=test',
+      csrfToken: 'csrf',
+      projectId: 'test_project',
+    });
+
+    assertEqual(result.status, 'success', 'compile status');
+    assertIncludes(result.log, 'mock compile log', 'compile log');
+
+    const pdf = result.outputFiles.find(f => f.path === 'output.pdf');
+    assert(pdf, 'should include output.pdf');
+    assertIncludes(pdf.url, `http://127.0.0.1:${port}/zone/zonea/project/test_project/user/user1/build/build1/output/output.pdf`, 'rewritten PDF URL');
+    assertIncludes(pdf.url, 'compileGroup=standard', 'compile group query');
+    assertIncludes(pdf.url, 'clsiserverid=one-two-three-four-zonea', 'clsi server query');
+    assertIncludes(pdf.url, 'enable_pdf_caching=true', 'pdf caching query');
+  });
+
+  await test('compile does not duplicate zone when download domain includes zone', async () => {
+    const result = await bridge.request('compile', {
+      cookie: 'mock_session=test',
+      csrfToken: 'csrf',
+      projectId: 'test_project_domain_zone',
+    });
+
+    const pdf = result.outputFiles.find(f => f.path === 'output.pdf');
+    assert(pdf, 'should include output.pdf');
+    assertIncludes(pdf.url, `http://127.0.0.1:${port}/zone/zonea/project/test_project_domain_zone/user/user1/build/build1/output/output.pdf`, 'rewritten PDF URL');
+    assert(!pdf.url.includes('/zone/zonea/zone/zonea/'), 'should not duplicate zone');
+  });
+
+  await test('compile does not duplicate zone when output path includes zone', async () => {
+    const result = await bridge.request('compile', {
+      cookie: 'mock_session=test',
+      csrfToken: 'csrf',
+      projectId: 'test_project_path_zone',
+    });
+
+    const pdf = result.outputFiles.find(f => f.path === 'output.pdf');
+    assert(pdf, 'should include output.pdf');
+    assertIncludes(pdf.url, `http://127.0.0.1:${port}/zone/zonea/project/test_project_path_zone/user/user1/build/build1/output/output.pdf`, 'rewritten PDF URL');
+    assert(!pdf.url.includes('/zone/zonea/zone/zonea/'), 'should not duplicate zone');
+  });
+
+  await test('downloadUrl follows redirects and returns a non-empty file', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'overleaf-test-'));
+    const result = await bridge.request('downloadUrl', {
+      cookie: 'mock_session=test',
+      url: `http://127.0.0.1:${port}/download/redirect-pdf`,
+      fileName: 'output.pdf',
+      outputDir: dir,
+    });
+
+    assert(result.path, 'should return downloaded path');
+    assert(result.bytes > 0, 'should return byte count');
+    assertEqual(fs.statSync(result.path).size, result.bytes, 'downloaded file size');
+    assertIncludes(fs.readFileSync(result.path, 'utf8'), '%PDF-1.4', 'downloaded PDF content');
+
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await test('downloadUrl rejects empty files', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'overleaf-test-'));
+    try {
+      await bridge.request('downloadUrl', {
+        cookie: 'mock_session=test',
+        url: `http://127.0.0.1:${port}/download/empty`,
+        fileName: 'empty.pdf',
+        outputDir: dir,
+      });
+      throw new Error('downloadUrl should have rejected empty file');
+    } catch (e) {
+      assertEqual(e.code, 'EMPTY_DOWNLOAD', 'empty download error code');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   // ── Test Suite: Document Operations ──────────────────────────────
