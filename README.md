@@ -9,12 +9,13 @@ Edit your Overleaf projects directly in Neovim with full real-time collaboration
 - **Real-time collaboration** — edits sync instantly with other Overleaf users via OT
 - **Full Neovim ecosystem** — treesitter, LSP, snippets, copilot, and all your plugins work out of the box
 - **File tree** — browse and manage project files in a sidebar
-- **Auto-authentication** — extracts session cookie from Chrome automatically (macOS)
+- **Auto-authentication** — extracts session cookie from Chrome or Arc automatically (macOS)
 - **Auto-reconnect** — recovers from disconnects and document restores seamlessly
 - **Compile & PDF preview** — compile LaTeX and open the PDF
-- **Comments & reviews** — view, reply, resolve comment threads
+- **Comments & reviews** — view, reply, resolve comment threads; open ranges render as diagnostics
 - **Collaborator cursors** — see where other users are editing
 - **Project-wide search** — grep across all documents
+- **Picker integration** — use snacks.picker for project, document, and search result pickers when available
 - **File management** — create, delete, rename, upload files
 - **History** — view project version history
 - **Diagnostics** — chktex linter + LaTeX compile errors via `vim.diagnostic`
@@ -95,44 +96,33 @@ To get the cookie manually: open overleaf.com in your browser → DevTools (F12)
 
 | Command | Description |
 |---------|-------------|
-| `:Overleaf` | Connect (or show status if connected) |
-| `:Overleaf connect` | Connect to Overleaf |
+| `:Overleaf projects` | Authenticate/connect if needed, or switch project |
+| `:Overleaf status` | Show connection status |
 | `:Overleaf disconnect` | Disconnect |
 | `:Overleaf compile` | Compile LaTeX project |
+| `:Overleaf compile local` | Compile locally once |
+| `:Overleaf compile watch` | Start local watch compile |
+| `:Overleaf compile stop` | Stop local watch compile |
 | `:Overleaf explorer` | Open the configured explorer |
-| `:Overleaf tree` | Alias for `:Overleaf explorer` |
-| `:Overleaf native_tree` | Open the built-in tree |
-| `:Overleaf open` | Open a document |
-| `:Overleaf projects` | Switch project |
-| `:Overleaf status` | Show connection status |
+| `:Overleaf explorer native` | Open the built-in tree |
+| `:Overleaf files` | Open the document picker |
 | `:Overleaf preview` | Preview binary file (images, etc.) |
 | `:Overleaf new [name]` | Create new document |
 | `:Overleaf mkdir [name]` | Create new folder |
 | `:Overleaf delete` | Delete file/folder |
 | `:Overleaf rename` | Rename file/folder |
 | `:Overleaf upload [path]` | Upload local file |
-| `:Overleaf search [pattern]` | Search across all documents |
-| `:Overleaf comments` | List all comments |
+| `:Overleaf search [pattern]` | Search across all documents; without a pattern, open the live search picker |
+| `:Overleaf comment add` | Create a comment on the current visual selection |
+| `:Overleaf comment show` | Show the comment thread under the cursor |
+| `:Overleaf comment reply` | Reply to the comment thread under the cursor |
+| `:Overleaf comment resolve` | Resolve/reopen the comment thread under the cursor |
+| `:Overleaf comments` | Refresh and list all unresolved project comments |
 | `:Overleaf comments refresh` | Refresh comments from server |
 | `:Overleaf history` | View project history |
 | `:Overleaf sync` | Sync all documents to/from disk |
 | `:Overleaf sync import` | Import external changes from disk to Overleaf |
 | `:Overleaf sync export` | Export all documents to disk |
-
-### Default Keymaps
-
-| Key | Description |
-|-----|-------------|
-| `<leader>oc` | Connect |
-| `<leader>od` | Disconnect |
-| `<leader>ob` | Build (compile) |
-| `<leader>ot` | Open explorer |
-| `<leader>oo` | Open document picker |
-| `<leader>op` | Preview file |
-| `<leader>or` | Read comment at cursor |
-| `<leader>oR` | Reply to comment |
-| `<leader>ox` | Resolve/reopen comment |
-| `<leader>of` | Find in project (search) |
 
 ### Native Tree Keymaps
 
@@ -189,15 +179,12 @@ require('overleaf').setup({
     open_pdf = true,
     auto_start_watch = false,
   },
-
-  -- Set to false to disable default keymaps
-  keys = true,
 })
 ```
 
 ## Workflow
 
-1. `:Overleaf` — authenticate and select a project
+1. `:Overleaf projects` — authenticate and select a project
 2. File explorer appears — press `Enter` to open a document
 3. Edit normally — changes sync to Overleaf in real-time
 4. `:w` — triggers compile and opens PDF

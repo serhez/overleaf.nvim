@@ -42,7 +42,7 @@ end
 
 function M.open()
   if not state().connected then
-    config.log('warn', 'Not connected. Run :Overleaf connect first.')
+    config.log('warn', 'Not connected. Run :Overleaf projects first.')
     return
   end
 

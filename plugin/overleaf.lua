@@ -1,94 +1,137 @@
--- Main :Overleaf command with subcommands
-local subcommands = {
-  connect = function() require('overleaf').connect() end,
+-- Main :Overleaf command with subcommands.
+local function rest(args, start)
+  if #args < start then return nil end
+  local value = table.concat(vim.list_slice(args, start), ' ')
+  return value ~= '' and value or nil
+end
+
+local commands = {
+  projects = function() require('overleaf').projects() end,
+  status = function() require('overleaf').status() end,
   disconnect = function() require('overleaf').disconnect() end,
-  compile = function(args)
-    if args == 'watch' then
-      require('overleaf').compile_watch()
-    elseif args == 'stop' then
-      require('overleaf').stop_compile_watch()
-    elseif args == 'local' then
-      require('overleaf').compile_local()
+
+  explorer = function(args)
+    if args[1] == 'native' then
+      require('overleaf').open_native_tree()
     else
-      require('overleaf').compile()
+      require('overleaf').open_explorer()
     end
   end,
-  explorer = function() require('overleaf').open_explorer() end,
-  tree = function() require('overleaf').open_explorer() end,
-  native_tree = function() require('overleaf').open_native_tree() end,
-  open = function(args) require('overleaf').open_document(args) end,
-  projects = function() require('overleaf').select_project() end,
-  status = function() require('overleaf').status() end,
+
+  files = function(args) require('overleaf').files(rest(args, 1)) end,
   preview = function() require('overleaf').preview_file() end,
-  new = function(args) require('overleaf').create_doc(args) end,
-  mkdir = function(args) require('overleaf').create_folder(args) end,
+
+  new = function(args) require('overleaf').create_doc(rest(args, 1)) end,
+  mkdir = function(args) require('overleaf').create_folder(rest(args, 1)) end,
   delete = function() require('overleaf').delete_entity() end,
   rename = function() require('overleaf').rename_entity() end,
-  upload = function(args) require('overleaf').upload_file(args) end,
-  search = function(args) require('overleaf').search(args) end,
+  upload = function(args) require('overleaf').upload_file(rest(args, 1)) end,
+
+  search = function(args) require('overleaf').search(rest(args, 1)) end,
+
+  comment = function(args)
+    local action = args[1] or 'add'
+    if action == 'add' then
+      require('overleaf').create_comment_from_selection()
+    elseif action == 'show' then
+      require('overleaf').show_comment()
+    elseif action == 'reply' then
+      require('overleaf').reply_comment()
+    elseif action == 'resolve' then
+      require('overleaf').resolve_comment()
+    else
+      vim.notify('Unknown Overleaf comment action: ' .. action, vim.log.levels.ERROR)
+    end
+  end,
+
   comments = function(args)
-    if args == 'refresh' then
+    if args[1] == 'refresh' then
       require('overleaf').refresh_comments()
     else
       require('overleaf').list_comments()
     end
   end,
-  history = function() require('overleaf').history() end,
+
+  compile = function(args)
+    local action = args[1]
+    if action == 'watch' then
+      require('overleaf').compile_watch()
+    elseif action == 'stop' then
+      require('overleaf').stop_compile_watch()
+    elseif action == 'local' then
+      require('overleaf').compile_local()
+    else
+      require('overleaf').compile()
+    end
+  end,
+
   sync = function(args)
-    if args == 'import' then
+    local action = args[1]
+    if action == 'import' then
       require('overleaf').sync_import()
-    elseif args == 'export' then
+    elseif action == 'export' then
       require('overleaf').sync_export()
     else
       require('overleaf').sync_all()
     end
   end,
+
+  history = function() require('overleaf').history() end,
+}
+
+local completions = vim.tbl_keys(commands)
+table.sort(completions)
+
+local subcommand_completions = {
+  comment = { 'add', 'show', 'reply', 'resolve' },
+  comments = { 'refresh' },
+  compile = { 'local', 'watch', 'stop' },
+  explorer = { 'native' },
+  sync = { 'import', 'export' },
 }
 
 vim.api.nvim_create_user_command('Overleaf', function(opts)
-  local args = vim.split(opts.args, '%s+', { trimempty = true })
+  local args = opts.fargs or {}
   local sub = args[1]
 
   if not sub or sub == '' then
-    -- No subcommand: if connected, show status; otherwise connect
-    local ol = require('overleaf')
-    if ol._state.connected then
-      ol.status()
-    else
-      ol.connect()
-    end
+    vim.notify('Usage: :Overleaf projects', vim.log.levels.INFO)
     return
   end
 
-  local handler = subcommands[sub]
-  if handler then
-    handler(args[2])
-  else
-    vim.notify(
-      'Unknown subcommand: ' .. sub .. '\nAvailable: ' .. table.concat(vim.tbl_keys(subcommands), ', '),
-      vim.log.levels.ERROR
-    )
+  local command = commands[sub]
+  if command then
+    command(vim.list_slice(args, 2))
+    return
   end
+
+  vim.notify(
+    'Unknown Overleaf subcommand: ' .. sub .. '\nAvailable: ' .. table.concat(completions, ', '),
+    vim.log.levels.ERROR
+  )
 end, {
   nargs = '*',
+  range = true,
   desc = 'Overleaf commands',
   complete = function(arglead, line, _)
     local parts = vim.split(line, '%s+', { trimempty = true })
-    -- Complete subcommand name
+
     if #parts <= 2 and not (line:match('%s$') and #parts >= 2) then
-      local prefix = arglead or ''
-      local completions = {}
-      for name in pairs(subcommands) do
-        if name:find(prefix, 1, true) == 1 then table.insert(completions, name) end
+      local matches = {}
+      for _, name in ipairs(completions) do
+        if name:find(arglead or '', 1, true) == 1 then table.insert(matches, name) end
       end
-      table.sort(completions)
-      return completions
+      return matches
     end
-    -- Complete subcommand arguments
+
     local sub = parts[2]
-    if sub == 'comments' then return { 'refresh' } end
-    if sub == 'compile' then return { 'local', 'watch', 'stop' } end
-    if sub == 'sync' then return { 'import', 'export' } end
-    return {}
+    local candidates = subcommand_completions[sub]
+    if not candidates then return {} end
+
+    local matches = {}
+    for _, name in ipairs(candidates) do
+      if name:find(arglead or '', 1, true) == 1 then table.insert(matches, name) end
+    end
+    return matches
   end,
 })

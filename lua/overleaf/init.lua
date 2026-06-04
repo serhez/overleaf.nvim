@@ -257,22 +257,6 @@ end
 function M.setup(opts)
   config.setup(opts)
   setup_autocmds()
-
-  -- Default keymaps (prefix: <leader>o for Overleaf)
-  local keys = opts and opts.keys or true
-  if keys then
-    local map = vim.keymap.set
-    map('n', '<leader>oc', function() M.connect() end, { desc = 'Overleaf: Connect' })
-    map('n', '<leader>od', function() M.disconnect() end, { desc = 'Overleaf: Disconnect' })
-    map('n', '<leader>ob', function() M.compile() end, { desc = 'Overleaf: Build (compile)' })
-    map('n', '<leader>ot', function() M.open_explorer() end, { desc = 'Overleaf: Explorer' })
-    map('n', '<leader>oo', function() M.select_document() end, { desc = 'Overleaf: Open document' })
-    map('n', '<leader>op', function() M.preview_file() end, { desc = 'Overleaf: Preview file' })
-    map('n', '<leader>or', function() M.show_comment() end, { desc = 'Overleaf: Read comment' })
-    map('n', '<leader>oR', function() M.reply_comment() end, { desc = 'Overleaf: Reply to comment' })
-    map('n', '<leader>ox', function() M.resolve_comment() end, { desc = 'Overleaf: Resolve/reopen comment' })
-    map('n', '<leader>of', function() M.search() end, { desc = 'Overleaf: Find in project' })
-  end
 end
 
 function M.connect()
@@ -831,30 +815,74 @@ function M.open_document(doc_id_or_path, doc_path, opts)
   end)
 end
 
-function M.select_project()
-  if #project._projects == 0 then
-    config.log('warn', 'Not authenticated. Run :OverleafConnect first.')
+function M.open_location(location)
+  if not location then return end
+
+  local doc_id = location.doc_id or location.id
+  local path = location.path or location.file
+  if not doc_id and not path then return end
+
+  local opts = {
+    bufnr = location.bufnr,
+    winid = location.winid,
+    lnum = location.lnum or location.line,
+    col = location.col,
+  }
+
+  if doc_id then
+    M.open_document(doc_id, path, opts)
+  else
+    M.open_document(path, nil, opts)
+  end
+end
+
+function M.projects()
+  if not bridge.is_running() or #project._projects == 0 then
+    M.connect()
     return
   end
 
   project.select_project(function(project_id, project_name)
+    if M._state.connected and M._state.project_id == project_id then
+      config.log('info', 'Already connected to: %s', project_name)
+      M.open_explorer()
+      return
+    end
+
     local cookie = config.get().cookie
     M._connect_project(cookie, project_id, project_name)
   end)
 end
 
+function M.select_project()
+  M.projects()
+end
+
 function M.select_document()
   if not M._state.connected then
-    config.log('warn', 'Not connected. Run :OverleafConnect first.')
+    config.log('warn', 'Not connected. Run :Overleaf projects first.')
     return
   end
 
   project.select_document(function(doc_id, doc_path) M.open_document(doc_id, doc_path) end)
 end
 
+function M.files(path)
+  if not M._state.connected then
+    config.log('warn', 'Not connected. Run :Overleaf projects first.')
+    return
+  end
+
+  if path and path ~= '' then
+    M.open_document(path)
+  else
+    M.select_document()
+  end
+end
+
 function M.open_explorer()
   if not M._state.connected then
-    config.log('warn', 'Not connected. Run :OverleafConnect first.')
+    config.log('warn', 'Not connected. Run :Overleaf projects first.')
     return
   end
   require('overleaf.explorer').open()
@@ -866,7 +894,7 @@ end
 
 function M.open_native_tree()
   if not M._state.connected then
-    config.log('warn', 'Not connected. Run :OverleafConnect first.')
+    config.log('warn', 'Not connected. Run :Overleaf projects first.')
     return
   end
   require('overleaf.tree').toggle()
@@ -874,7 +902,7 @@ end
 
 function M.preview_file()
   if not M._state.connected then
-    config.log('warn', 'Not connected. Run :Overleaf connect first.')
+    config.log('warn', 'Not connected. Run :Overleaf projects first.')
     return
   end
 
@@ -1160,7 +1188,7 @@ end
 
 function M.compile()
   if not M._state.connected then
-    config.log('warn', 'Not connected. Run :Overleaf connect first.')
+    config.log('warn', 'Not connected. Run :Overleaf projects first.')
     return
   end
 
