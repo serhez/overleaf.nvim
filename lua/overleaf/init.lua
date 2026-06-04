@@ -551,11 +551,9 @@ end
 function M._rejoin_documents()
   for _, doc in pairs(M._state.documents) do
     if doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then
-      -- Reset all state for clean rejoin
+      -- Stop delayed flushes; rejoin decides whether local buffer edits must be preserved.
       doc._rejoining = false
       doc.joined = false
-      doc.inflight_op = nil
-      doc.pending_ops = nil
       if doc._flush_timer then
         vim.fn.timer_stop(doc._flush_timer)
         doc._flush_timer = nil

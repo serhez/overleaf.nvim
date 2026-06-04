@@ -251,6 +251,74 @@ describe('document', function()
     end)
   end)
 
+  describe('rejoin', function()
+    it('preserves dirty local buffer edits after rejoining', function()
+      local doc = Document.new('test_doc', '/main.tex')
+      doc.version = 5
+      doc.content = 'Server before'
+      doc.server_content = 'Server before'
+      doc.inflight_op = { { p = 13, i = ' local' } }
+      doc._preserve_local_on_rejoin = true
+
+      local bufnr = vim.api.nvim_create_buf(true, false)
+      vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { 'Local buffer edit' })
+      vim.bo[bufnr].modified = true
+      doc.bufnr = bufnr
+
+      local flushed = false
+      doc.flush = function() flushed = true end
+
+      doc:_finish_rejoin({ version = 6, lines = { 'Server after' }, ranges = {} })
+
+      assert.is_true(doc.joined)
+      assert.are.equal(6, doc.version)
+      assert.are.equal('Server after', doc.server_content)
+      assert.are.equal('Local buffer edit', doc.content)
+      assert.are.same({
+        { p = 0, d = 'Server after' },
+        { p = 0, i = 'Local buffer edit' },
+      }, doc.pending_ops)
+      assert.is_true(vim.bo[bufnr].modified)
+      assert.is_true(flushed)
+
+      local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+      assert.are.equal('Local buffer edit', table.concat(lines, '\n'))
+
+      vim.api.nvim_buf_delete(bufnr, { force = true })
+    end)
+
+    it('updates a clean buffer from the server after rejoining', function()
+      local doc = Document.new('test_doc', '/main.tex')
+      doc.version = 5
+      doc.content = 'Server before'
+      doc.server_content = 'Server before'
+
+      local bufnr = vim.api.nvim_create_buf(true, false)
+      vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { 'Server before' })
+      vim.bo[bufnr].modified = false
+      doc.bufnr = bufnr
+
+      doc:_finish_rejoin({ version = 6, lines = { 'Server after' }, ranges = {} })
+
+      assert.is_true(doc.joined)
+      assert.are.equal(6, doc.version)
+      assert.are.equal('Server after', doc.content)
+      assert.are.equal('Server after', doc.server_content)
+      assert.is_nil(doc.pending_ops)
+
+      vim.wait(100, function()
+        local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+        return table.concat(lines, '\n') == 'Server after'
+      end)
+
+      local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+      assert.are.equal('Server after', table.concat(lines, '\n'))
+      assert.is_false(vim.bo[bufnr].modified)
+
+      vim.api.nvim_buf_delete(bufnr, { force = true })
+    end)
+  end)
+
   describe('on_remote_op', function()
     it('applies remote insert to content and increments version', function()
       local doc = Document.new('test_doc', '/main.tex')

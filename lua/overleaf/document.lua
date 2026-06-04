@@ -102,8 +102,6 @@ function Document:flush()
   }, function(err, _)
     if err then
       config.log('warn', 'OT update failed for %s: %s — rejoining', self.path, err.message)
-      self.inflight_op = nil
-      self.pending_ops = nil
       self:rejoin()
       return
     end
@@ -127,11 +125,67 @@ function Document:_on_ack()
   if self.pending_ops then self:flush() end
 end
 
+function Document:_buffer_content()
+  if not self.bufnr or not vim.api.nvim_buf_is_valid(self.bufnr) then return nil end
+  local lines = vim.api.nvim_buf_get_lines(self.bufnr, 0, -1, false)
+  return table.concat(lines, '\n')
+end
+
+function Document:_has_local_buffer_edits()
+  if self.inflight_op or self.pending_ops then return true end
+  if self.bufnr and vim.api.nvim_buf_is_valid(self.bufnr) and vim.bo[self.bufnr].modified then return true end
+  return false
+end
+
+local replace_content_ops
+
+function Document:_finish_rejoin(result)
+  self._rejoining = false
+
+  local server_content = table.concat(result.lines, '\n')
+  local local_content = self:_buffer_content()
+  local preserve_local = self._preserve_local_on_rejoin
+    or (self.bufnr and vim.api.nvim_buf_is_valid(self.bufnr) and vim.bo[self.bufnr].modified)
+  self._preserve_local_on_rejoin = nil
+
+  self.version = result.version
+  self.server_content = server_content
+  self.joined = true
+  self.ranges = result.ranges
+
+  if preserve_local and local_content and local_content ~= server_content then
+    self.content = local_content
+    self.pending_ops = replace_content_ops(server_content, local_content)
+    self.inflight_op = nil
+
+    if self.bufnr and vim.api.nvim_buf_is_valid(self.bufnr) then vim.bo[self.bufnr].modified = true end
+    pcall(function() require('overleaf.sync').schedule_write(self) end)
+
+    config.log('info', 'Rejoined doc %s (v%d), preserving local buffer edits', self.path, self.version)
+    self:flush()
+    return
+  end
+
+  self.content = server_content
+
+  config.log('info', 'Rejoined doc %s (v%d)', self.path, self.version)
+
+  if self.bufnr and vim.api.nvim_buf_is_valid(self.bufnr) then
+    vim.schedule(function()
+      self.applying_remote = true
+      vim.api.nvim_buf_set_lines(self.bufnr, 0, -1, false, result.lines)
+      vim.bo[self.bufnr].modified = false
+      self.applying_remote = false
+    end)
+  end
+end
+
 --- Rejoin document to resync state (e.g., after version mismatch or restore)
 ---@param attempt number internal retry counter
 function Document:rejoin(attempt)
   attempt = attempt or 1
   if self._rejoining and attempt == 1 then return end
+  self._preserve_local_on_rejoin = self._preserve_local_on_rejoin or self:_has_local_buffer_edits()
   self._rejoining = true
   self.joined = false
   self.inflight_op = nil
@@ -159,29 +213,12 @@ function Document:rejoin(attempt)
         return
       end
 
-      self._rejoining = false
-      local content = table.concat(result.lines, '\n')
-      self.version = result.version
-      self.content = content
-      self.server_content = content
-      self.joined = true
-      self.ranges = result.ranges
-
-      config.log('info', 'Rejoined doc %s (v%d)', self.path, self.version)
-
-      if self.bufnr and vim.api.nvim_buf_is_valid(self.bufnr) then
-        vim.schedule(function()
-          self.applying_remote = true
-          vim.api.nvim_buf_set_lines(self.bufnr, 0, -1, false, result.lines)
-          vim.bo[self.bufnr].modified = false
-          self.applying_remote = false
-        end)
-      end
+      self:_finish_rejoin(result)
     end)
   end, delay)
 end
 
-local function replace_content_ops(from_content, to_content)
+replace_content_ops = function(from_content, to_content)
   local ops = {}
   if #from_content > 0 then table.insert(ops, { p = 0, d = from_content }) end
   if #to_content > 0 then table.insert(ops, { p = 0, i = to_content }) end
