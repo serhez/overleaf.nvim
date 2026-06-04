@@ -9,6 +9,9 @@ M._sync_dir = nil
 M._watchers = {} -- path -> {handle, doc_id}
 M._write_timers = {} -- doc_id -> timer
 M._writing = {} -- path -> true (suppress watcher during our writes)
+M._uri_bridge_installed = false
+M._orig_uri_from_bufnr = nil
+M._orig_uri_to_bufnr = nil
 
 --- Get the active sync directory.
 ---@return string|nil
@@ -56,6 +59,17 @@ function M.file_path(doc_path)
   return M._sync_dir .. '/' .. doc_path
 end
 
+--- Get the document path for a local mirror path.
+---@param file_path string local file path
+---@return string|nil doc_path
+function M.doc_path_from_file_path(file_path)
+  if not M._sync_dir or not file_path or file_path == '' then return nil end
+  local root = M._sync_dir:gsub('/+$', '')
+  if file_path == root then return '' end
+  if file_path:sub(1, #root + 1) == root .. '/' then return file_path:sub(#root + 2) end
+  return nil
+end
+
 --- Get the live buffer name for a document.
 ---@param doc_path string Overleaf document path
 ---@return string
@@ -68,10 +82,74 @@ end
 ---@return string|nil doc_path the document path if it's an Overleaf buffer
 function M.parse_buf_name(bufname)
   if bufname:match('^overleaf://') then return bufname:gsub('^overleaf://', '') end
-  if M._sync_dir and bufname:sub(1, #M._sync_dir) == M._sync_dir then
-    return bufname:sub(#M._sync_dir + 2) -- +2 for the trailing /
+  return M.doc_path_from_file_path(bufname)
+end
+
+--- Convert a live Overleaf buffer to the local mirror URI used by LSP clients.
+---@param bufnr number
+---@return string|nil uri
+function M.lsp_uri_from_bufnr(bufnr)
+  if not vim.api.nvim_buf_is_valid(bufnr) then return nil end
+
+  local doc_path = vim.b[bufnr].overleaf_doc_path
+  if not doc_path then doc_path = M.parse_buf_name(vim.api.nvim_buf_get_name(bufnr)) end
+  if not doc_path or doc_path == '' then return nil end
+
+  local file_path = M.file_path(doc_path)
+  if not file_path then return nil end
+  return vim.uri_from_fname(file_path)
+end
+
+--- Resolve an LSP local mirror URI back to the live Overleaf buffer, if loaded.
+---@param uri string
+---@return number|nil bufnr
+function M.bufnr_from_lsp_uri(uri)
+  if not uri or uri == '' then return nil end
+
+  local file_path
+  if uri:match('^file://') then
+    local ok, fname = pcall(vim.uri_to_fname, uri)
+    if ok then file_path = fname end
+  elseif uri:match('^overleaf://') then
+    local doc_path = uri:gsub('^overleaf://', '')
+    local bufnr = vim.fn.bufnr(M.buf_name(doc_path))
+    if bufnr ~= -1 and vim.api.nvim_buf_is_valid(bufnr) then return bufnr end
+    return nil
   end
+
+  local doc_path = M.doc_path_from_file_path(file_path)
+  if not doc_path or doc_path == '' then return nil end
+
+  local bufnr = vim.fn.bufnr(M.buf_name(doc_path))
+  if bufnr ~= -1 and vim.api.nvim_buf_is_valid(bufnr) then return bufnr end
   return nil
+end
+
+--- Make Neovim LSP see live overleaf:// buffers as their synced local file URI.
+---
+--- The buffer name stays overleaf:// so Overleaf OT/collaboration stays attached,
+--- but LSP servers such as texlab receive file:// URIs under sync_dir and can
+--- resolve related .tex/.bib files from the local mirror.
+function M.install_lsp_uri_bridge()
+  if M._uri_bridge_installed then return end
+  M._uri_bridge_installed = true
+
+  M._orig_uri_from_bufnr = vim.uri_from_bufnr
+  M._orig_uri_to_bufnr = vim.uri_to_bufnr
+
+  vim.uri_from_bufnr = function(bufnr)
+    bufnr = vim._resolve_bufnr and vim._resolve_bufnr(bufnr or 0)
+      or (bufnr == 0 and vim.api.nvim_get_current_buf() or bufnr)
+    local uri = M.lsp_uri_from_bufnr(bufnr)
+    if uri then return uri end
+    return M._orig_uri_from_bufnr(bufnr)
+  end
+
+  vim.uri_to_bufnr = function(uri)
+    local bufnr = M.bufnr_from_lsp_uri(uri)
+    if bufnr then return bufnr end
+    return M._orig_uri_to_bufnr(uri)
+  end
 end
 
 --- Write a document's content to disk immediately

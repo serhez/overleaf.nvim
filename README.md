@@ -267,6 +267,8 @@ require('overleaf').setup({
 
 When connected to a project, all text documents are synced to `~/.overleaf/<project-name>/`. External tools can read and edit these files — changes are automatically detected and synced back to Overleaf. Neovim still edits live `overleaf://` buffers so collaborator updates, cursors, comments, and OT synchronization continue to work normally.
 
+LaTeX LSP servers are started with this synced project directory as their workspace root. Live buffers keep their `overleaf://` names for Overleaf OT/collaboration, but the LSP protocol sees the matching local `file://` URI from the mirror. That lets tools such as texlab index unopened `.tex` and `.bib` files for labels, references, and citations.
+
 ### How it works
 
 - **On connect**: all documents are fetched and written to disk

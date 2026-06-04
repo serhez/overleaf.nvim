@@ -1,19 +1,38 @@
 local ot = require('overleaf.ot')
 local config = require('overleaf.config')
+local sync = require('overleaf.sync')
 
 local M = {}
 
 --- Create a Neovim buffer for an Overleaf document
 ---@param doc table Document instance
 ---@param lines string[] document lines
+---@param opts? {bufnr?: number}
 ---@return number bufnr
-function M.create(doc, lines)
-  local bufnr = vim.api.nvim_create_buf(true, false)
-  vim.api.nvim_buf_set_name(bufnr, require('overleaf.sync').buf_name(doc.path))
+function M.create(doc, lines, opts)
+  opts = opts or {}
+
+  local name = sync.buf_name(doc.path)
+  local bufnr = opts.bufnr
+
+  if bufnr and not vim.api.nvim_buf_is_valid(bufnr) then bufnr = nil end
+
+  if not bufnr then
+    local existing = vim.fn.bufnr(name)
+    if existing ~= -1 and vim.api.nvim_buf_is_valid(existing) then bufnr = existing end
+  end
+
+  if not bufnr then bufnr = vim.api.nvim_create_buf(true, false) end
+
+  if vim.api.nvim_buf_get_name(bufnr) ~= name then vim.api.nvim_buf_set_name(bufnr, name) end
 
   -- Buffer options first
   vim.bo[bufnr].buftype = 'acwrite'
   vim.bo[bufnr].swapfile = false
+  vim.bo[bufnr].modifiable = true
+  vim.b[bufnr].overleaf_qf_placeholder = false
+  vim.b[bufnr].overleaf_doc_id = doc.doc_id
+  vim.b[bufnr].overleaf_doc_path = doc.path
 
   -- Set content
   vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
@@ -103,6 +122,7 @@ end
 --- Manually attach LSP servers to an Overleaf buffer
 function M._attach_lsp(bufnr, ft)
   if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then return end
+  sync.install_lsp_uri_bridge()
 
   -- LSP language IDs differ from Neovim filetypes
   local lang_id_map = { tex = 'latex', bib = 'bibtex' }
@@ -126,29 +146,130 @@ function M._attach_lsp(bufnr, ft)
     if ft == 'tex' then table.insert(servers, { name = 'texlab', cmd = { 'texlab' } }) end
   end
 
-  -- Mason installs to ~/.local/share/nvim/mason/bin/
-  local mason_bin = vim.fn.stdpath('data') .. '/mason/bin/'
+  local function start_servers()
+    if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then return end
+    local root_dir = M._lsp_root_dir()
 
-  for _, srv in ipairs(servers) do
-    local cmd = srv.cmd[1]
-    -- Check system PATH and mason bin
-    if vim.fn.executable(cmd) ~= 1 then
-      local mason_cmd = mason_bin .. cmd
-      if vim.fn.executable(mason_cmd) == 1 then srv.cmd[1] = mason_cmd end
+    -- Mason installs to ~/.local/share/nvim/mason/bin/
+    local mason_bin = vim.fn.stdpath('data') .. '/mason/bin/'
+
+    for _, srv in ipairs(servers) do
+      local server_config = M._lsp_server_config(srv, root_dir, lang_id_map)
+      local cmd = type(server_config.cmd) == 'table' and server_config.cmd[1] or nil
+      -- Check system PATH and mason bin
+      if cmd and vim.fn.executable(cmd) ~= 1 then
+        local mason_cmd = mason_bin .. cmd
+        if vim.fn.executable(mason_cmd) == 1 then server_config.cmd[1] = mason_cmd end
+      end
+      -- Skip if command not found anywhere
+      if type(server_config.cmd) ~= 'table' or vim.fn.executable(server_config.cmd[1]) ~= 1 then
+        config.log('debug', 'LSP %s not found, skipping', srv.name)
+      elseif not M._has_lsp_client(bufnr, srv.name) then
+        pcall(
+          vim.lsp.start,
+          server_config,
+          {
+            bufnr = bufnr,
+            reuse_client = function(client, client_config)
+              return client.name == client_config.name and client.config.root_dir == client_config.root_dir
+            end,
+          }
+        )
+      end
     end
-    -- Skip if command not found anywhere
-    if vim.fn.executable(srv.cmd[1]) ~= 1 then
-      config.log('debug', 'LSP %s not found, skipping', srv.name)
-    else
-      pcall(vim.lsp.start, {
-        name = srv.name,
-        cmd = srv.cmd,
-        root_dir = vim.fn.getcwd(),
-        settings = srv.settings,
-        get_language_id = function(_, filetype) return lang_id_map[filetype] or filetype end,
-      }, { bufnr = bufnr })
+
+    pcall(function() vim.bo[bufnr].omnifunc = 'v:lua.vim.lsp.omnifunc' end)
+  end
+
+  if sync.dir() then
+    require('overleaf.ops').sync_project(function() vim.schedule(start_servers) end)
+  else
+    start_servers()
+  end
+end
+
+function M._lsp_root_dir()
+  return sync.dir() or vim.fn.getcwd()
+end
+
+function M._lsp_capabilities()
+  local capabilities = vim.lsp.protocol.make_client_capabilities()
+  for _, module_name in ipairs({ 'blink.cmp', 'blink-cmp' }) do
+    local ok, blink = pcall(require, module_name)
+    if ok and type(blink.get_lsp_capabilities) == 'function' then
+      local ok_caps, blink_capabilities = pcall(blink.get_lsp_capabilities, capabilities)
+      if ok_caps and blink_capabilities then return blink_capabilities end
     end
   end
+  return capabilities
+end
+
+function M._lsp_settings(server_name, root_dir, settings)
+  settings = vim.deepcopy(settings or {})
+  if server_name == 'texlab' and root_dir then
+    settings.texlab = settings.texlab or {}
+    settings.texlab.rootDirectory = root_dir
+  end
+  return settings
+end
+
+function M._lsp_configured_server(name)
+  if type(vim.lsp.config) == 'table' and type(vim.lsp.config[name]) == 'table' then
+    return vim.deepcopy(vim.lsp.config[name])
+  end
+  return {}
+end
+
+local function merge_config(dst, src)
+  dst = vim.deepcopy(dst or {})
+  for key, value in pairs(src or {}) do
+    if type(value) == 'table' and type(dst[key]) == 'table' then
+      dst[key] = merge_config(dst[key], value)
+    else
+      dst[key] = vim.deepcopy(value)
+    end
+  end
+  return dst
+end
+
+function M._lsp_server_config(srv, root_dir, lang_id_map)
+  local configured = M._lsp_configured_server(srv.name)
+  local settings = merge_config(configured.settings, srv.settings)
+
+  local server_config = merge_config(configured, {
+    name = srv.name,
+    cmd = vim.deepcopy(configured.cmd or srv.cmd),
+    root_dir = root_dir,
+    cmd_cwd = root_dir,
+    settings = M._lsp_settings(srv.name, root_dir, settings),
+    capabilities = configured.capabilities or M._lsp_capabilities(),
+    get_language_id = function(_, filetype) return lang_id_map[filetype] or filetype end,
+  })
+
+  if root_dir then
+    server_config.workspace_folders = {
+      {
+        uri = vim.uri_from_fname(root_dir),
+        name = vim.fn.fnamemodify(root_dir, ':t'),
+      },
+    }
+  end
+
+  return server_config
+end
+
+function M._has_lsp_client(bufnr, name)
+  local clients = {}
+  if vim.lsp.get_clients then
+    clients = vim.lsp.get_clients({ bufnr = bufnr, name = name })
+  elseif vim.lsp.buf_get_clients then
+    clients = vim.lsp.buf_get_clients(bufnr)
+  end
+
+  for _, client in pairs(clients or {}) do
+    if client.name == name then return true end
+  end
+  return false
 end
 
 --- Attach on_bytes listener to buffer for change detection

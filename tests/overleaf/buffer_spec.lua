@@ -1,5 +1,7 @@
 local ot = require('overleaf.ot')
 local buffer = require('overleaf.buffer')
+local config = require('overleaf.config')
+local sync = require('overleaf.sync')
 
 -- Counter for unique buffer names
 local test_counter = 0
@@ -135,6 +137,91 @@ describe('buffer', function()
 
       -- check_content should have detected the mismatch
       assert.is_true(doc._rejoin_called)
+
+      vim.api.nvim_buf_delete(bufnr, { force = true })
+    end)
+  end)
+
+  describe('LSP configuration', function()
+    local old_sync_dir
+    local old_texlab_config
+
+    before_each(function()
+      sync.stop()
+      old_sync_dir = config.get().sync_dir
+      old_texlab_config = vim.deepcopy(vim.lsp.config.texlab)
+    end)
+
+    after_each(function()
+      sync.stop()
+      config.get().sync_dir = old_sync_dir
+      vim.lsp.config.texlab = old_texlab_config or {}
+    end)
+
+    it('uses the active sync directory as the LSP root', function()
+      config.get().sync_dir = '/tmp/overleaf.nvim-lsp-test'
+      sync.start('Paper: Draft')
+
+      assert.are.equal('/tmp/overleaf.nvim-lsp-test/Paper_ Draft', buffer._lsp_root_dir())
+    end)
+
+    it('falls back to cwd when file sync is not active', function()
+      assert.are.equal(vim.fn.getcwd(), buffer._lsp_root_dir())
+    end)
+
+    it('builds texlab config with the synced project as workspace root', function()
+      local root = '/tmp/overleaf.nvim-lsp-test/Paper'
+      local srv = {
+        name = 'texlab',
+        cmd = { 'texlab' },
+        settings = { texlab = { build = { onSave = false } } },
+      }
+
+      local lsp_config = buffer._lsp_server_config(srv, root, { tex = 'latex' })
+
+      assert.are.equal('texlab', lsp_config.name)
+      assert.are.equal(root, lsp_config.root_dir)
+      assert.are.equal(root, lsp_config.cmd_cwd)
+      assert.are.equal(root, lsp_config.settings.texlab.rootDirectory)
+      assert.are.equal(false, lsp_config.settings.texlab.build.onSave)
+      assert.are.equal(vim.uri_from_fname(root), lsp_config.workspace_folders[1].uri)
+      assert.are.equal('Paper', lsp_config.workspace_folders[1].name)
+      assert.are.equal('latex', lsp_config.get_language_id(nil, 'tex'))
+    end)
+
+    it('preserves existing Neovim LSP server configuration', function()
+      local root = '/tmp/overleaf.nvim-lsp-test/Paper'
+      local on_attach = function() end
+      vim.lsp.config.texlab = {
+        cmd = { 'custom-texlab' },
+        on_attach = on_attach,
+        settings = { texlab = { diagnosticsDelay = 123 } },
+        capabilities = { workspace = { didChangeWatchedFiles = { dynamicRegistration = true } } },
+      }
+
+      local lsp_config = buffer._lsp_server_config({ name = 'texlab', cmd = { 'texlab' } }, root, { tex = 'latex' })
+
+      assert.are.equal('custom-texlab', lsp_config.cmd[1])
+      assert.are.equal(on_attach, lsp_config.on_attach)
+      assert.are.equal(123, lsp_config.settings.texlab.diagnosticsDelay)
+      assert.are.equal(root, lsp_config.settings.texlab.rootDirectory)
+      assert.is_true(lsp_config.capabilities.workspace.didChangeWatchedFiles.dynamicRegistration)
+    end)
+
+    it('bridges overleaf buffer URIs to synced local file URIs for LSP', function()
+      config.get().sync_dir = '/tmp/overleaf.nvim-lsp-test'
+      sync.start('Paper')
+      sync.install_lsp_uri_bridge()
+
+      local bufnr = vim.api.nvim_create_buf(true, false)
+      vim.api.nvim_buf_set_name(bufnr, 'overleaf://main.tex')
+      vim.b[bufnr].overleaf_doc_path = 'main.tex'
+
+      local local_path = '/tmp/overleaf.nvim-lsp-test/Paper/main.tex'
+      local local_uri = vim.uri_from_fname(local_path)
+
+      assert.are.equal(local_uri, vim.uri_from_bufnr(bufnr))
+      assert.are.equal(bufnr, vim.uri_to_bufnr(local_uri))
 
       vim.api.nvim_buf_delete(bufnr, { force = true })
     end)
