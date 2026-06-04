@@ -839,7 +839,7 @@ function M.search(pattern)
   if pattern then
     do_search(pattern)
   else
-    vim.ui.input({ prompt = 'Search pattern: ' }, do_search)
+    require('overleaf.search').live(M._state)
   end
 end
 
