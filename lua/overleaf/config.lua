@@ -18,6 +18,7 @@ M._config = {
   },
   sync_dir = nil, -- Local file sync directory (nil = disabled; enables external tool integration)
   explorer = 'native', -- 'native' or 'canola'
+  picker = 'auto', -- 'auto', 'snacks', or 'native'
   cleanup_buffers_on_exit = true, -- Wipe overleaf:// buffers before exit so sessions don't restore dead buffers
   log_level = 'info', -- 'debug', 'info', 'warn', 'error'
 }

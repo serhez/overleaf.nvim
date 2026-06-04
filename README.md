@@ -171,6 +171,10 @@ require('overleaf').setup({
   -- The canola explorer requires sync_dir.
   explorer = 'native',
 
+  -- Picker integration: 'auto', 'snacks', or 'native' (default: 'auto')
+  -- 'auto' uses snacks.picker when available and falls back to vim.ui.select/quickfix.
+  picker = 'auto',
+
   -- Wipe overleaf:// and canola-overleaf:// buffers before Neovim exits.
   -- This prevents session managers from restoring inert virtual buffers.
   cleanup_buffers_on_exit = true,

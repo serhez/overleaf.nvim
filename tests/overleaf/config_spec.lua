@@ -22,6 +22,8 @@ describe('config', function()
 
     it('has explorer defaulting to native', function() assert.are.equal('native', config.get().explorer) end)
 
+    it('has picker defaulting to auto', function() assert.are.equal('auto', config.get().picker) end)
+
     it('uses Overleaf compile backend by default', function()
       assert.are.equal('overleaf', config.get().compile.backend)
       assert.is_true(config.get().compile.open_pdf)
@@ -47,6 +49,11 @@ describe('config', function()
     it('overrides explorer', function()
       config.setup({ explorer = 'canola' })
       assert.are.equal('canola', config.get().explorer)
+    end)
+
+    it('overrides picker', function()
+      config.setup({ picker = 'native' })
+      assert.are.equal('native', config.get().picker)
     end)
 
     it('overrides cleanup_buffers_on_exit', function()

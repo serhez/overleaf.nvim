@@ -22,7 +22,7 @@ function M.select_project(callback)
     })
   end
 
-  vim.ui.select(items, {
+  require('overleaf.picker').select(items, {
     prompt = 'Select Overleaf Project:',
     format_item = function(item) return item.label .. ' (' .. item.detail .. ')' end,
   }, function(choice)
@@ -92,12 +92,7 @@ function M.select_document(callback)
     return
   end
 
-  vim.ui.select(M._project_tree, {
-    prompt = 'Select Document:',
-    format_item = function(item) return item.path end,
-  }, function(choice)
-    if choice then callback(choice.id, choice.path) end
-  end)
+  require('overleaf.picker').documents(M._project_tree, callback)
 end
 
 function M.get_doc_by_id(doc_id)

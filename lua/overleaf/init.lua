@@ -62,11 +62,46 @@ function M.cleanup_buffers()
   for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
     if vim.api.nvim_buf_is_valid(bufnr) then
       local name = vim.api.nvim_buf_get_name(bufnr)
-      if name:match('^overleaf://') or name:match('^canola%-overleaf://') then
+      if name:match('^overleaf://') or name:match('^overleaf%-qf://') or name:match('^canola%-overleaf://') then
         pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
       end
     end
   end
+end
+
+function M._reset_project_session()
+  if M._reconnect then
+    M._reconnect.attempt = 0
+    M._reconnect.in_progress = false
+    if M._reconnect.timer then
+      vim.fn.timer_stop(M._reconnect.timer)
+      M._reconnect.timer = nil
+    end
+  end
+
+  pcall(function() require('overleaf.local_compile').stop_watch({ silent = true }) end)
+  sync.stop()
+  pcall(function() require('overleaf.cursors').clear_all() end)
+  pcall(function() require('overleaf.comments').clear_all() end)
+
+  for _, doc in pairs(M._state.documents) do
+    if doc._flush_timer then
+      vim.fn.timer_stop(doc._flush_timer)
+      doc._flush_timer = nil
+    end
+    doc.joined = false
+    doc.inflight_op = nil
+    doc.pending_ops = nil
+    doc._rejoining = false
+  end
+
+  M.cleanup_buffers()
+  M._state.connected = false
+  M._state.project_name = nil
+  M._state.project_id = nil
+  M._state.project_data = nil
+  M._state.documents = {}
+  project.parse_project_tree(nil)
 end
 
 local function setup_autocmds()
@@ -189,11 +224,16 @@ function M._get_cookie_fallback(callback)
     callback(cookie)
     return
   end
-  config.log('error', 'No cookie found. Log in to overleaf.com in Chrome, or set OVERLEAF_COOKIE in .env')
+  config.log('error', 'No cookie found. Log in to overleaf.com in Chrome or Arc, or set OVERLEAF_COOKIE in .env')
   callback(nil)
 end
 
 function M._connect_project(cookie, project_id, project_name)
+  if M._state.project_id and M._state.project_id ~= project_id then
+    config.log('info', 'Switching Overleaf projects; clearing old project buffers')
+    M._reset_project_session()
+  end
+
   config.log('info', 'Connecting to project: %s', project_name)
 
   -- Register event handlers before connecting
@@ -244,6 +284,8 @@ function M._connect_project(cookie, project_id, project_name)
 end
 
 function M._setup_event_handlers()
+  bridge._event_handlers = {}
+
   bridge.on_event('otUpdateApplied', function(data)
     -- Skip own-ACK events (no op field = acknowledgment for our own op)
     -- Our ACK is already handled by the applyOtUpdate callback → _on_ack()
@@ -568,6 +610,9 @@ function M.open_document(doc_id_or_path, doc_path, opts)
   local doc_id = doc_id_or_path
   local path = doc_path
   local target_win = opts.winid or vim.api.nvim_get_current_win()
+  local target_bufnr = opts.bufnr
+  local target_line = tonumber(opts.lnum or opts.line)
+  local target_col = tonumber(opts.col)
 
   local function in_target_window(fn)
     if target_win and vim.api.nvim_win_is_valid(target_win) then
@@ -575,6 +620,16 @@ function M.open_document(doc_id_or_path, doc_path, opts)
     else
       fn()
     end
+  end
+
+  local function jump_to_target()
+    if not target_line or target_line < 1 then return end
+
+    local line_count = vim.api.nvim_buf_line_count(0)
+    local line = math.min(target_line, math.max(line_count, 1))
+    local col = math.max((target_col or 1) - 1, 0)
+    pcall(vim.api.nvim_win_set_cursor, 0, { line, col })
+    pcall(vim.cmd, 'normal! zvzz')
   end
 
   if not path then
@@ -593,7 +648,10 @@ function M.open_document(doc_id_or_path, doc_path, opts)
   if M._state.documents[doc_id] then
     local existing = M._state.documents[doc_id]
     if existing.bufnr and vim.api.nvim_buf_is_valid(existing.bufnr) then
-      in_target_window(function() vim.api.nvim_set_current_buf(existing.bufnr) end)
+      in_target_window(function()
+        vim.api.nvim_set_current_buf(existing.bufnr)
+        jump_to_target()
+      end)
       return
     end
   end
@@ -607,7 +665,10 @@ function M.open_document(doc_id_or_path, doc_path, opts)
       return
     end
 
-    in_target_window(function() buffer.create(doc, lines) end)
+    in_target_window(function()
+      buffer.create(doc, lines, { bufnr = target_bufnr })
+      jump_to_target()
+    end)
 
     -- Write to sync dir and start watching for external changes
     sync.write_doc(doc)
