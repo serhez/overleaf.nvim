@@ -4,6 +4,7 @@ local project = require('overleaf.project')
 local Document = require('overleaf.document')
 local buffer = require('overleaf.buffer')
 local sync = require('overleaf.sync')
+local ot = require('overleaf.ot')
 
 local M = {}
 
@@ -45,14 +46,151 @@ local function open_file(file_path)
   end
 end
 
+local function current_document()
+  local bufnr = vim.api.nvim_get_current_buf()
+  for doc_id, doc in pairs(M._state.documents) do
+    if doc.bufnr == bufnr then return bufnr, doc_id, doc end
+  end
+  return bufnr, nil, nil
+end
+
+local function clamp_col(line, col)
+  return math.max(0, math.min(tonumber(col) or 0, #(line or '')))
+end
+
+local function next_utf8_col(line, col)
+  line = line or ''
+  col = clamp_col(line, col)
+  if col >= #line then return #line end
+
+  local byte = line:byte(col + 1)
+  if not byte then return #line end
+
+  local len = 1
+  if byte >= 0xF0 then
+    len = 4
+  elseif byte >= 0xE0 then
+    len = 3
+  elseif byte >= 0xC0 then
+    len = 2
+  end
+
+  return math.min(col + len, #line)
+end
+
+local function selected_text_range(bufnr, doc_content)
+  local start_pos = vim.fn.getpos("'<")
+  local end_pos = vim.fn.getpos("'>")
+  if not start_pos or not end_pos or start_pos[2] == 0 or end_pos[2] == 0 then
+    return nil, 'Select text visually first'
+  end
+  if start_pos[1] ~= 0 and start_pos[1] ~= bufnr then return nil, 'Visual selection is not in this buffer' end
+  if end_pos[1] ~= 0 and end_pos[1] ~= bufnr then return nil, 'Visual selection is not in this buffer' end
+
+  local start_row = start_pos[2] - 1
+  local end_row = end_pos[2] - 1
+  local start_col = start_pos[3] - 1
+  local end_col = end_pos[3] - 1
+
+  if start_row > end_row or (start_row == end_row and start_col > end_col) then
+    start_row, end_row = end_row, start_row
+    start_col, end_col = end_col, start_col
+  end
+
+  local line_count = vim.api.nvim_buf_line_count(bufnr)
+  if start_row < 0 or end_row < 0 or start_row >= line_count or end_row >= line_count then
+    return nil, 'Visual selection is outside the current buffer'
+  end
+
+  local mode = vim.fn.visualmode()
+  if mode == '\22' then return nil, 'Blockwise visual comments are not supported yet' end
+
+  local start_line = vim.api.nvim_buf_get_lines(bufnr, start_row, start_row + 1, false)[1] or ''
+  local end_line = vim.api.nvim_buf_get_lines(bufnr, end_row, end_row + 1, false)[1] or ''
+
+  if mode == 'V' then
+    start_col = 0
+    end_col = #end_line
+  else
+    start_col = clamp_col(start_line, start_col)
+    end_col = next_utf8_col(end_line, end_col)
+  end
+
+  local lines = vim.api.nvim_buf_get_text(bufnr, start_row, start_col, end_row, end_col, {})
+  local text = table.concat(lines, '\n')
+  if text == '' then return nil, 'Visual selection is empty' end
+
+  local byte_offset = ot.pos_to_byte_offset(doc_content or '', start_row, start_col)
+  return {
+    text = text,
+    offset = ot.byte_to_char(doc_content or '', byte_offset),
+  }
+end
+
+local function generate_comment_thread_id()
+  local uv = vim.uv or vim.loop
+  local seed = table.concat({
+    tostring(os.time()),
+    tostring(uv and uv.hrtime and uv.hrtime() or ''),
+    tostring(math.random()),
+  }, ':')
+  local hash = vim.fn.sha256(seed)
+  return string.format('%08x', os.time()) .. hash:sub(1, 10) .. '000001'
+end
+
+local function normalize_path(path)
+  if not path or path == '' then return nil end
+  return vim.fn.fnamemodify(vim.fn.expand(path), ':p'):gsub('/$', '')
+end
+
+local function is_inside(path, root)
+  path = normalize_path(path)
+  root = normalize_path(root)
+  if not path or not root then return false end
+  return path == root or vim.startswith(path, root .. '/')
+end
+
+local function canola_url_path(url)
+  if not url or not vim.startswith(url, 'canola://') then return nil end
+  return url:gsub('^canola://', '')
+end
+
 M._state = {
   connected = false,
   project_name = nil,
   project_id = nil,
   project_data = nil,
   csrf_token = nil,
+  user_id = nil,
+  user_email = nil,
   documents = {}, -- doc_id -> Document
 }
+
+function M.is_overleaf_context(bufnr)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  if not vim.api.nvim_buf_is_valid(bufnr) then return false end
+
+  local bufname = vim.api.nvim_buf_get_name(bufnr)
+  if bufname:match('^overleaf://') or bufname:match('^overleaf%-qf://') or bufname:match('^canola%-overleaf://') then
+    return true
+  end
+
+  local active_sync_dir = sync.dir()
+  if active_sync_dir and is_inside(bufname, active_sync_dir) then return true end
+
+  local configured_sync_dir = config.get().sync_dir
+  if configured_sync_dir and is_inside(bufname, configured_sync_dir) then return true end
+
+  if vim.bo[bufnr].filetype == 'canola' then
+    local ok, canola = pcall(require, 'canola')
+    local url = ok and canola.get_current_url and canola.get_current_url(bufnr) or nil
+    if url and vim.startswith(url, 'canola-overleaf://') then return true end
+    if configured_sync_dir and is_inside(canola_url_path(url), configured_sync_dir) then return true end
+    if active_sync_dir and is_inside(canola_url_path(url), active_sync_dir) then return true end
+  end
+
+  return false
+end
 
 function M.cleanup_buffers()
   for _, doc in pairs(M._state.documents) do
@@ -162,6 +300,8 @@ function M.connect()
 
         config.log('info', 'Authenticated as %s (%d projects)', result.userEmail or result.userId, #result.projects)
         M._state.csrf_token = result.csrfToken
+        M._state.user_id = result.userId
+        M._state.user_email = result.userEmail
         project.set_projects(result.projects)
 
         -- Step 4: Select project
@@ -297,6 +437,12 @@ function M._setup_event_handlers()
         buffer.apply_remote(doc, transformed_ops)
         sync.schedule_write(doc)
       end)
+
+      local comments = require('overleaf.comments')
+      comments.on_comment_ops(data.doc, data.op)
+      if doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) and doc.content then
+        comments.render(doc.bufnr, data.doc, doc.content)
+      end
     end
   end)
 
@@ -1324,6 +1470,80 @@ function M.list_comments()
   require('overleaf.comments').list_all(M._state.project_id)
 end
 
+function M.create_comment_from_selection()
+  if not M._state.connected then
+    config.log('warn', 'Not connected.')
+    return
+  end
+
+  local bufnr, doc_id, doc = current_document()
+  if not doc_id then
+    config.log('warn', 'Not an Overleaf document')
+    return
+  end
+  if not doc.joined then
+    config.log('warn', 'Document is not joined yet')
+    return
+  end
+  if doc.check_content and not doc:check_content({ recover_pending = true }) then return end
+
+  local selection, selection_err = selected_text_range(bufnr, doc.content)
+  if not selection then
+    config.log('warn', selection_err or 'No visual selection')
+    return
+  end
+
+  vim.ui.input({ prompt = 'Comment: ' }, function(content)
+    if not content or content == '' then return end
+
+    local thread_id = generate_comment_thread_id()
+    bridge.request('addComment', {
+      cookie = config.get().cookie,
+      csrfToken = M._state.csrf_token,
+      projectId = M._state.project_id,
+      threadId = thread_id,
+      content = content,
+    }, function(err, result)
+      if err then
+        config.log('error', 'Comment failed: %s', err.message)
+        return
+      end
+
+      local message = type(result) == 'table' and (result.comment or result.message or result) or nil
+      local comments = require('overleaf.comments')
+      comments.add_local_thread(doc_id, thread_id, selection.offset, selection.text, content, {
+        id = M._state.user_id,
+        email = M._state.user_email,
+        first_name = 'You',
+      }, message)
+      comments._doc_contents[doc_id] = doc.content
+
+      doc.ranges = doc.ranges or {}
+      doc.ranges.comments = doc.ranges.comments or {}
+      table.insert(doc.ranges.comments, {
+        op = {
+          p = selection.offset,
+          c = selection.text,
+          t = thread_id,
+        },
+      })
+
+      doc:submit_op({ {
+        p = selection.offset,
+        c = selection.text,
+        t = thread_id,
+      } })
+
+      vim.schedule(function()
+        if doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then
+          require('overleaf.comments').render(doc.bufnr, doc_id, doc.content)
+        end
+      end)
+      config.log('info', 'Comment added')
+    end)
+  end)
+end
+
 function M.reply_comment()
   if not M._state.connected then
     config.log('warn', 'Not connected.')
@@ -1495,6 +1715,8 @@ function M.disconnect()
   M._state.project_id = nil
   M._state.project_data = nil
   M._state.csrf_token = nil
+  M._state.user_id = nil
+  M._state.user_email = nil
 
   config.log('info', 'Disconnected')
 end
