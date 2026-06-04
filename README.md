@@ -26,7 +26,7 @@ Edit your Overleaf projects directly in Neovim with full real-time collaboration
 - Neovim >= 0.10
 - Node.js >= 18
 - An [Overleaf](https://www.overleaf.com) account
-- Chrome / Chromium (for automatic cookie extraction) or a session cookie
+- Chrome or Arc (for automatic cookie extraction on macOS) or a session cookie
 
 ## Installation
 
@@ -65,9 +65,9 @@ cd ~/.local/share/nvim/lazy/overleaf.nvim/node && npm install
 
 ## Authentication
 
-### Option 1: Chrome (automatic)
+### Option 1: Browser (automatic)
 
-Just log in to [overleaf.com](https://www.overleaf.com) in Chrome. The plugin extracts the session cookie automatically. If you have multiple Chrome profiles, you'll be prompted to select one.
+Just log in to [overleaf.com](https://www.overleaf.com) in Chrome or Arc. The plugin extracts the session cookie automatically (macOS). If more than one browser profile is available, you'll be prompted to select one.
 
 ### Option 2: Manual cookie
 

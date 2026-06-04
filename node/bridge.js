@@ -8,7 +8,7 @@ const https = require('https');
 const path = require('path');
 const auth = require('./auth');
 const SocketManager = require('./socket');
-const { getOverleafCookie, listProfiles } = require('./chrome-cookie');
+const { getOverleafCookie, listProfiles } = require('./browser-cookie');
 
 // Redirect console.log to stderr (stdout is the RPC channel)
 const origLog = console.log;
@@ -163,13 +163,13 @@ const handlers = {
     return { status: 'ok' };
   },
 
-  async listChromeProfiles(params) {
+  async listBrowserProfiles(params) {
     const profiles = listProfiles();
     return { profiles };
   },
 
   async getCookie(params) {
-    const cookie = await getOverleafCookie(params.profile);
+    const cookie = await getOverleafCookie(params.browser, params.profile);
     return { cookie };
   },
 

@@ -139,41 +139,41 @@ function M.connect()
 end
 
 function M._get_cookie(callback)
-  -- Chrome first, then config/env as fallback
-  config.log('info', 'Checking Chrome profiles...')
-  bridge.request('listChromeProfiles', {}, function(err, result)
+  -- Browser (Chrome/Arc/...) first, then config/env as fallback
+  config.log('info', 'Checking browser profiles...')
+  bridge.request('listBrowserProfiles', {}, function(err, result)
     if err or not result or not result.profiles or #result.profiles == 0 then
-      config.log('debug', 'Chrome profiles not available: %s', err and err.message or 'none found')
+      config.log('debug', 'Browser profiles not available: %s', err and err.message or 'none found')
       M._get_cookie_fallback(callback)
       return
     end
 
     local profiles = result.profiles
 
-    local function extract_from_profile(profile_dir)
-      config.log('info', 'Extracting cookie from Chrome (%s)...', profile_dir)
-      bridge.request('getCookie', { profile = profile_dir }, function(cookie_err, cookie_result)
+    local function extract_from_profile(profile)
+      config.log('info', 'Extracting cookie from %s (%s)...', profile.browserName, profile.dir)
+      bridge.request('getCookie', { browser = profile.browser, profile = profile.dir }, function(cookie_err, cookie_result)
         if not cookie_err and cookie_result and cookie_result.cookie then
-          config.log('info', 'Cookie extracted from Chrome')
+          config.log('info', 'Cookie extracted from %s', profile.browserName)
           config.get().cookie = cookie_result.cookie
           callback(cookie_result.cookie)
           return
         end
-        config.log('debug', 'Chrome extraction failed: %s', cookie_err and cookie_err.message or 'unknown')
+        config.log('debug', '%s extraction failed: %s', profile.browserName, cookie_err and cookie_err.message or 'unknown')
         M._get_cookie_fallback(callback)
       end)
     end
 
     if #profiles == 1 then
-      extract_from_profile(profiles[1].dir)
+      extract_from_profile(profiles[1])
     else
       vim.schedule(function()
         vim.ui.select(profiles, {
-          prompt = 'Select Chrome Profile:',
-          format_item = function(item) return item.name .. ' (' .. item.dir .. ')' end,
+          prompt = 'Select browser profile:',
+          format_item = function(item) return item.browserName .. ' — ' .. item.name .. ' (' .. item.dir .. ')' end,
         }, function(choice)
           if choice then
-            extract_from_profile(choice.dir)
+            extract_from_profile(choice)
           else
             M._get_cookie_fallback(callback)
           end
