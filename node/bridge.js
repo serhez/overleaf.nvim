@@ -8,6 +8,8 @@ const https = require('https');
 const path = require('path');
 const auth = require('./auth');
 const SocketManager = require('./socket');
+const { rebaseHistory } = require('./sync/history');
+const { SyncSession } = require('./sync/session');
 const { getOverleafCookie, listProfiles } = require('./browser-cookie');
 
 // Redirect console.log to stderr (stdout is the RPC channel)
@@ -20,7 +22,18 @@ const BASE_ORIGIN = new URL(BASE_URL).origin;
 let requestId = 0;
 let socketManager = null;
 let pendingRequests = 0;
+let pendingSyncRequests = 0;
 let stdinClosed = false;
+let exiting = false;
+let abandonNetwork = false;
+const syncSessions = new Map();
+const syncMethods = new Set(['syncOpen', 'syncDocument', 'syncClose']);
+
+function syncSession(id) {
+  const session = syncSessions.get(id);
+  if (!session) throw { code: 'STALE_SESSION', message: 'Synchronization session is no longer active' };
+  return session;
+}
 
 function send(obj) {
   process.stdout.write(JSON.stringify(obj) + '\n');
@@ -161,6 +174,30 @@ async function downloadToFile(url, cookie, filePath, redirectCount = 0) {
 const handlers = {
   async ping(params) {
     return { status: 'ok' };
+  },
+
+  async rebaseEditorHistory(params) {
+    return await rebaseHistory(params.history, params.content);
+  },
+
+  async syncOpen(params) {
+    const session = await SyncSession.open(params);
+    syncSessions.set(session.id, session);
+    return { session: session.id, directory: session.directory };
+  },
+
+  async syncDocument(params) {
+    const reply = await syncSession(params.session).document(params);
+    if (params.action === 'remote') {
+      sendEvent('syncChanged', { session: reply.session, document: reply.document, revision: reply.revision });
+    }
+    return reply;
+  },
+
+  async syncClose(params) {
+    await syncSession(params.session).close();
+    syncSessions.delete(params.session);
+    return { session: params.session, closed: true };
   },
 
   async listBrowserProfiles(params) {
@@ -476,8 +513,16 @@ const handlers = {
 };
 
 function maybeExit() {
-  if (stdinClosed && pendingRequests === 0 && !socketManager) {
-    process.exit(0);
+  if (stdinClosed && (pendingRequests === 0 || (abandonNetwork && pendingSyncRequests === 0)) && !exiting) {
+    exiting = true;
+    if (socketManager) {
+      socketManager.disconnect();
+      socketManager = null;
+    }
+    Promise.all([...syncSessions.values()].map(session => session.close())).then(
+      () => process.exit(0),
+      error => { console.error('Recovery store close failed:', error.message); process.exit(1); }
+    );
   }
 }
 
@@ -503,6 +548,8 @@ async function handleMessage(line) {
   }
 
   pendingRequests++;
+  const persists = syncMethods.has(method);
+  if (persists) pendingSyncRequests++;
   try {
     const result = await handler(params || {});
     sendResult(id, result);
@@ -512,6 +559,7 @@ async function handleMessage(line) {
     sendError(id, code, message);
   } finally {
     pendingRequests--;
+    if (persists) pendingSyncRequests--;
     maybeExit();
   }
 }
@@ -536,8 +584,11 @@ rl.on('close', () => {
     socketManager = null;
   }
   maybeExit();
-  // Force exit after 5s if pending requests don't complete
-  setTimeout(() => process.exit(0), 5000).unref();
+  // A stalled network request must not prevent shutdown indefinitely, but this
+  // deadline never interrupts an accepted recovery operation or store close.
+  setTimeout(() => { abandonNetwork = true; maybeExit(); }, 5000).unref();
+  // Clean EOF drains accepted persistence work. SIGTERM/SIGKILL remain abrupt
+  // exits and deliberately leave writer locks for explicit recovery.
 });
 
 process.on('SIGTERM', () => {

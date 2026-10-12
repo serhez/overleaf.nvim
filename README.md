@@ -300,6 +300,144 @@ Claude Code can now read all your LaTeX files and make edits that sync back to O
 
 The plugin spawns a Node.js bridge process that connects to Overleaf's real-time collaboration server via Socket.IO. Edits in Neovim are converted to OT operations and sent to the server. Remote edits from other collaborators are transformed and applied to your buffer in real-time.
 
+## Development
+
+Run the Lua, Node synchronization, and bridge integration suites with `make test`.
+Run only the synchronization engine tests with `node --test tests/node/sync/*.test.js`.
+
+The document engine under `node/sync/` is not used for normal editing yet. The
+editing and mirroring behavior described above still applies. The engine provides:
+
+- Immutable recovery snapshots, revision checks, persisted upload intent, and an
+  exclusive writer lock. `SnapshotStore.open(directory)` acquires ownership;
+  `close()` drains accepted writes and releases it. Constructing a store directly
+  provides read-only recovery access. A crashed writer leaves its lock in place
+  for explicit recovery after verifying that the original writer has stopped.
+- Separate remote, saved, and unsaved buffer state, merged with Git's file merger.
+- Local undo/redo entries rebased against current text. Independent incoming edits
+  survive undo; ambiguous overlaps leave text and history unchanged. Identical
+  edits made independently by two people may be undone together, once per local
+  history entry. Undo does not publish anything until the result is saved.
+
+The editor history adapter in `lua/overleaf/editor/history.lua` captures native
+undo trees, including redo and alternate branches. The bridge's
+`rebaseEditorHistory({ history, content })` request uses Git to rebase those states
+without connecting to Overleaf. A clean response contains the complete rebased
+tree; a conflict contains the conflicting inputs and no installable tree.
+`install(capture, history, modified)` checks buffer revisions before installing it,
+and `dispose(capture)` releases temporary recovery files. The caller must persist
+recovery state before installation and supply the disk-related modified flag.
+
+`checkpoint(capture)` exports the text tree, per-state native empty-buffer flags,
+native undo bytes, metadata, and editor options (including BOM) for durable
+storage. The engine's `checkpointEditor(checkpoint,
+revision)` records what Neovim actually displays separately from its reconciled
+buffer target. Once attached, native checkpoints own undo; the standalone
+`edit`, `undo`, `redo`, `save`, and `resolve` entry points are unavailable for that
+document. Native conflict-resolution integration is still required.
+
+`prepareEditorUpdate(revision)` persists a proposal before returning its token,
+rebased native tree, exact buffer text (`content`), and ordinary-save text
+(`writeContent`, including `fixendofline`). The adapter reports installation through
+`acceptEditorUpdate(token, checkpoint)` or a metadata/size hold through
+`holdEditorUpdate(token, reason)`. Held revisions and subsequent incoming changes
+remain in recovery storage. `saveEditor(checkpoint, revision, content)` requires
+the exact text observed on disk at save time, validates it against the captured
+ordinary write, and retries against its fresh history. `SAVE_MISMATCH` preserves
+engine state and pauses the controller for separate disk reconciliation; custom
+write handlers or external writers cannot silently substitute another revision.
+Save reconciliation accounts for
+incoming text the editor has not yet displayed; checkpoints alone never publish
+unsaved text. Restarting with an unconfirmed import holds it for a fresh editor
+observation rather than assuming it succeeded.
+
+History rebasing is limited to 1,000 states and 16 MiB of snapshot text. A conflict
+or exceeded limit holds the buffer update without truncating history. Supported
+histories retain native sequence IDs, timestamps, and file-write markers. The
+metadata adapter handles Neovim's version-3 undo files on 64-bit Neovim 0.10–0.12
+and limits each native undo file to 64 MiB; unknown layouts are held. Both the
+original and candidate imports are checked in a scratch buffer before the live
+buffer is changed.
+
+`HISTORY_HELD` leaves the live text and undo tree untouched. One such case is a
+current save counter that differs from the last save counter: Neovim cannot
+reliably restore that position together with time-based navigation. A normal save
+can make the history installable. A retry may remain held if another limit or
+conflict still applies; it never forces an update or drops undo history.
+
+The bridge exposes `syncOpen({ root, server, projectId })`,
+`syncDocument({ session, document, action, ... })`, and `syncClose({ session })`.
+Recovery directories are keyed by normalized server URL and project ID. Document
+actions are `open`, `state`, `snapshot`, `remote`, `checkpoint`, `save`, `prepare`,
+`accept`, and `hold`; each reply carries its session, document, and revision.
+These APIs do not send updates to Overleaf or write project sources. Session close
+drains accepted work before releasing the recovery-store writer lock.
+
+`lua/overleaf/editor/session.lua` binds an opened engine document to an ordinary
+buffer through `attach(buf, binding, { modified, saved, on_status })`. The workspace
+must supply `modified(writeContent)`, comparing the candidate's ordinary-save
+text against actual disk state, and synchronous `saved()`, returning the exact
+file bytes observed at save time. These callbacks must detect unstable reads and
+report failures rather than guess. `TextChanged` and text-related `OptionSet`
+events deliver unsaved checkpoints; `BufWritePost` captures native history and
+saved bytes immediately, even while a previous request is pending. The `save`
+RPC sends those bytes as canonical base64 in `bytes`, then validates UTF-8 before
+comparing them with the checkpoint. Incoming
+revisions trigger guarded updates, and ordinary saves retry held updates. Captures
+of ongoing insert-mode edits and buffer installations wait until insert mode ends
+to preserve undo grouping; already captured saves can still be delivered.
+`stop()` detaches the controller without deleting its buffer and returns paths to
+any unconfirmed recovery captures. Persistence failures pause imports and retain
+those captures; obsolete session/document replies cannot change the buffer.
+
+Normal bridge shutdown closes stdin and drains accepted synchronization requests
+and recovery writes before reporting the process stopped. Unresponsive network
+requests can be abandoned after five seconds; this deadline does not interrupt
+recovery writes. New requests and starts receive `STOPPING` while it drains.
+Abrupt termination retains recovery locks for explicit inspection.
+
+`node/sync/codec.js` provides `decodeBytes(bytes, options)`,
+`decodeText(text, options)`, `editorText(view, { forWrite })`, and
+`encodeEditor(view, { forWrite })`. A view contains joined native `content`, an
+explicit `empty` flag, and editor `options`. It distinguishes empty files from
+blank lines, preserves Unicode, BOMs, LF/CRLF and missing terminal newlines, and
+applies `fixendofline` only when describing a write. Encoding tests compare 128
+combinations against actual Neovim writes. Invalid UTF-8, NUL, binary buffers,
+non-UTF-8 encodings, classic Mac line endings, and mixed DOS/Unix input under DOS
+options are rejected. Native history merges use exact text and convert back to
+editor lines without changing options; an unrepresentable result remains held
+as `text-options`.
+
+`Workspace.open({ root, recovery })` in `node/sync/workspace.js` owns an exclusive
+recovery store outside the source tree. Both paths must be absolute; callers
+must assign one stable recovery directory to each source root. Its API is:
+
+- `observe(relativePath)`: read twice with content, file identity, metadata, and
+  parent-directory checks; persist exact bytes and return a revisioned record.
+  It does not change source files or make observations publishable engine saves.
+- `write(relativePath, bytes, revision)`: require the recorded source identity and
+  contents, durably retain the original and candidate, stage and flush the file,
+  recheck the source and writer ownership, then atomically install. Existing
+  POSIX mode/owner/group are retained. Creation never overwrites a competing file.
+- `snapshot(relativePath)`: inspect durable observations and pending intents.
+  An interrupted write blocks further observations/writes for that file until
+  explicit recovery; it is never assumed complete or retried automatically.
+- `close()`: drain accepted work before releasing recovery ownership.
+
+Source files are limited to 16 MiB. Traversal, symlinked source paths, nonregular
+files, and hard-linked files are rejected. Missing sources remain observations,
+not instructions to delete remote documents. Two matching reads cannot prove an
+external writer has finished, and rename is not a filesystem compare-and-swap:
+an uncooperative writer can still race the final check and installation. These
+guards assume trusted source directories, not hostile directory replacement.
+Directory watching, rescans, explicit write recovery, lifecycle handling, and
+the coordinator connecting this adapter to engine/editor revisions remain required.
+
+The legacy editing path does not attach the new controller or workspace adapter
+yet. Other remaining integration includes window/selection preservation,
+large-history performance, native conflict resolution, and verified transport
+encoding and acknowledgements that confirm application rather than queueing.
+
 ## Disclaimer
 
 This is an **unofficial** plugin and is not affiliated with, endorsed by, or supported by [Overleaf](https://www.overleaf.com). It relies on Overleaf's internal real-time collaboration protocol, which is undocumented and may change at any time without notice. Such changes could cause the plugin to stop working, or in the worst case, lead to document corruption or data loss.

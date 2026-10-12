@@ -8,6 +8,7 @@ M._pending = {} -- id -> {callback, timer}
 M._event_handlers = {} -- event_name -> handler[]
 M._buffer = ''
 M._started = false
+M._stopping = false
 M._on_unexpected_exit = nil -- callback for auto-reconnect
 M._stderr_tail = {}
 
@@ -22,6 +23,10 @@ local function exit_message()
 end
 
 function M.start(callback)
+  if M._stopping then
+    if callback then callback({ code = 'STOPPING', message = 'Bridge is draining accepted requests' }) end
+    return
+  end
   if M._job_id then
     if callback then callback(nil) end
     return
@@ -30,6 +35,7 @@ function M.start(callback)
   local script = config.bridge_script()
   local node = config.get().node_path
   M._stderr_tail = {}
+  M._buffer = ''
 
   -- Pass base_url to bridge as OVERLEAF_URL environment variable
   local env = nil
@@ -38,8 +44,11 @@ function M.start(callback)
 
   M._job_id = vim.fn.jobstart({ node, script }, {
     env = env,
-    on_stdout = function(_, data, _) M._on_stdout(data) end,
-    on_stderr = function(_, data, _)
+    on_stdout = function(job, data, _)
+      if job == M._job_id then M._on_stdout(data) end
+    end,
+    on_stderr = function(job, data, _)
+      if job ~= M._job_id then return end
       for _, line in ipairs(data) do
         if line ~= '' then
           remember_stderr(line)
@@ -47,23 +56,23 @@ function M.start(callback)
         end
       end
     end,
-    on_exit = function(_, code, _)
+    on_exit = function(job, code, _)
+      if job ~= M._job_id then return end
       config.log('warn', 'Bridge exited with code %d', code)
-      local was_started = M._started
+      local unexpected = M._started and not M._stopping
       M._job_id = nil
       M._started = false
+      M._stopping = false
       -- Notify pending requests of failure
       for _, pending in pairs(M._pending) do
         if pending.timer then vim.fn.timer_stop(pending.timer) end
         if pending.callback then
-          vim.schedule(
-            function() pending.callback({ code = 'BRIDGE_DIED', message = exit_message() }, nil) end
-          )
+          vim.schedule(function() pending.callback({ code = 'BRIDGE_DIED', message = exit_message() }, nil) end)
         end
       end
       M._pending = {}
       -- Trigger auto-restart if bridge died unexpectedly
-      if was_started and M._on_unexpected_exit then vim.schedule(function() M._on_unexpected_exit(code) end) end
+      if unexpected and M._on_unexpected_exit then vim.schedule(function() M._on_unexpected_exit(code) end) end
     end,
     stdout_buffered = false,
     stderr_buffered = false,
@@ -86,21 +95,21 @@ function M.start(callback)
 end
 
 function M.stop()
-  if M._job_id then
-    M.request('disconnect', {}, function() end)
-    vim.defer_fn(function()
-      if M._job_id then
-        vim.fn.jobstop(M._job_id)
-        M._job_id = nil
-        M._started = false
-      end
-    end, 500)
+  if M._job_id and not M._stopping then
+    M._stopping = true
+    -- EOF lets Node finish accepted requests and close recovery stores. Keep
+    -- the job identity until on_exit; an old exit must not clear a newer job.
+    vim.fn.chanclose(M._job_id, 'stdin')
   end
 end
 
 function M.is_running() return M._job_id ~= nil and M._started end
 
 function M.request(method, params, callback)
+  if M._stopping then
+    if callback then callback({ code = 'STOPPING', message = 'Bridge is draining accepted requests' }, nil) end
+    return
+  end
   if not M._job_id then
     if callback then callback({ code = 'NOT_STARTED', message = 'Bridge not started' }, nil) end
     return

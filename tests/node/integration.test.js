@@ -192,6 +192,137 @@ async function runTests() {
     assertEqual(result.status, 'ok', 'ping status');
   });
 
+  await test('editor history can be rebased while disconnected from Overleaf', async () => {
+    const result = await bridge.request('rebaseEditorHistory', {
+      history: { current: 1, preferred: 1, nodes: [
+        { seq: 0, parent: null, content: 'intro\nseparator\nending' },
+        { seq: 1, parent: 0, content: 'MY intro\nseparator\nending' },
+      ] },
+      content: 'MY intro\nseparator\nTHEIR ending',
+    });
+    assertEqual(result.status, 'clean');
+    assertEqual(result.history.nodes[0].content, 'intro\nseparator\nTHEIR ending');
+    assertEqual(result.history.nodes[1].content, 'MY intro\nseparator\nTHEIR ending');
+    assertEqual(result.history.nodes.length, 2, 'incoming changes do not create undo entries');
+  });
+
+  await test('editor history RPC returns conflicts without a partial installable tree', async () => {
+    const result = await bridge.request('rebaseEditorHistory', {
+      history: { current: 1, preferred: 1, nodes: [
+        { seq: 0, parent: null, content: 'before' },
+        { seq: 1, parent: 0, content: 'after' },
+      ] },
+      content: 'after expanded by colleague',
+    });
+    assertEqual(result.status, 'conflict');
+    assertEqual(result.seq, 0);
+    assertEqual(result.inputs.local, 'before');
+    assertEqual(result.history, undefined);
+  });
+
+  await test('malformed editor history is rejected without stopping the bridge', async () => {
+    let rejected = false;
+    try {
+      await bridge.request('rebaseEditorHistory', { history: { nodes: [] }, content: 'text' });
+    } catch (error) {
+      rejected = true;
+      assertIncludes(error.message, 'root state');
+    }
+    assert(rejected, 'invalid history must be rejected');
+    assertEqual((await bridge.request('ping')).status, 'ok');
+  });
+
+  await test('recovery sessions reject obsolete project tokens and retain incoming revisions', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'overleaf-rpc-session-'));
+    const options = { root, server: 'https://example.test', projectId: 'project' };
+    let session;
+    try {
+      session = (await bridge.request('syncOpen', options)).session;
+      const opened = await bridge.request('syncDocument', { session, document: 'doc', action: 'open', initial: { content: 'before', version: 1 } });
+      assertEqual(opened.session, session);
+      assertEqual(opened.document, 'doc');
+      await bridge.request('syncDocument', { session, document: 'doc', action: 'remote', remote: { content: 'after', version: 2 } });
+      const oldSession = session;
+      await bridge.request('syncClose', { session });
+      session = (await bridge.request('syncOpen', options)).session;
+      const recovered = await bridge.request('syncDocument', { session, document: 'doc', action: 'open' });
+      assertEqual(recovered.state.buffer, 'after');
+      let rejected = false;
+      try {
+        await bridge.request('syncDocument', { session: oldSession, document: 'doc', action: 'remote', remote: { content: 'obsolete', version: 3 } });
+      } catch (error) {
+        rejected = true;
+        assertEqual(error.code, 'STALE_SESSION');
+      }
+      assert(rejected, 'old sessions cannot mutate a reopened document');
+    } finally {
+      if (session) await bridge.request('syncClose', { session });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  await test('clean bridge EOF drains accepted sync requests before releasing the writer', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'overleaf-rpc-eof-'));
+    const client = new BridgeClient(port);
+    const options = { root, server: 'https://example.test', projectId: 'project' };
+    await client.start();
+    try {
+      const { session } = await client.request('syncOpen', options);
+      await client.request('syncDocument', { session, document: 'doc', action: 'open', initial: { content: 'before', version: 1 } });
+      const exit = new Promise(resolve => client.proc.once('exit', resolve));
+      const pending = client.request('syncDocument', { session, document: 'doc', action: 'remote', remote: { content: 'after', version: 2 } });
+      client.proc.stdin.end();
+      assertEqual((await pending).state.buffer, 'after');
+      assertEqual(await exit, 0);
+      const { SyncSession } = require('../../node/sync/session');
+      const reopened = await SyncSession.open(options);
+      try {
+        assertEqual((await reopened.document({ document: 'doc', action: 'open' })).state.buffer, 'after');
+      } finally { await reopened.close(); }
+    } finally {
+      client.stop();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  await test('shutdown can abandon a stalled network request while preserving accepted recovery writes', async () => {
+    let seen;
+    const requested = new Promise(resolve => { seen = resolve; });
+    const sockets = new Set();
+    const stalled = require('http').createServer(() => seen());
+    stalled.on('connection', socket => { sockets.add(socket); socket.on('close', () => sockets.delete(socket)); });
+    await new Promise(resolve => stalled.listen(0, '127.0.0.1', resolve));
+    const client = new BridgeClient(stalled.address().port);
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'overleaf-rpc-stalled-'));
+    const options = { root, server: 'https://example.test', projectId: 'project' };
+    await client.start();
+    try {
+      const { session } = await client.request('syncOpen', options);
+      await client.request('syncDocument', { session, document: 'doc', action: 'open', initial: { content: 'before', version: 1 } });
+      client.proc.stdin.write(JSON.stringify({ id: 99999, method: 'auth', params: { cookie: 'test' } }) + '\n');
+      await requested;
+      let timer;
+      const exit = new Promise((resolve, reject) => {
+        timer = setTimeout(() => reject(new Error('Network request prevented bridge shutdown')), 8000);
+        client.proc.once('exit', code => { clearTimeout(timer); resolve(code); });
+      });
+      const pending = client.request('syncDocument', { session, document: 'doc', action: 'remote', remote: { content: 'after', version: 2 } });
+      client.proc.stdin.end();
+      assertEqual((await pending).state.buffer, 'after');
+      assertEqual(await exit, 0);
+      const { SyncSession } = require('../../node/sync/session');
+      const reopened = await SyncSession.open(options);
+      try {
+        assertEqual((await reopened.document({ document: 'doc', action: 'open' })).state.buffer, 'after');
+      } finally { await reopened.close(); }
+    } finally {
+      client.stop();
+      for (const socket of sockets) socket.destroy();
+      await new Promise(resolve => stalled.close(resolve));
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   await test('connect to mock server', async () => {
     // The connect handler needs a cookie, but our mock doesn't validate
     // We need to bypass the auth.updateCookies call — use a special flag

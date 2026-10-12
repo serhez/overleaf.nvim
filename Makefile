@@ -14,6 +14,7 @@ test-lua: $(PLENARY_DIR)
 
 test-node:
 	cd tests/node && npm install --silent 2>/dev/null
+	node --test tests/node/sync/*.test.js
 	node tests/node/integration.test.js
 
 lint:
