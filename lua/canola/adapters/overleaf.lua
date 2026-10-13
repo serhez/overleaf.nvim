@@ -5,17 +5,11 @@ local M = {}
 
 local SCHEME = 'canola-overleaf://'
 
-local function constants()
-  return require('canola.constants')
-end
+local function constants() return require('canola.constants') end
 
-local function cache()
-  return require('canola.cache')
-end
+local function cache() return require('canola.cache') end
 
-local function util()
-  return require('canola.util')
-end
+local function util() return require('canola.util') end
 
 local function clean_adapter_path(path)
   path = path or '/'
@@ -32,9 +26,7 @@ local function url_to_project_path(url)
   return clean_adapter_path(path)
 end
 
-local function project_path_to_url(path)
-  return SCHEME .. '/' .. clean_adapter_path(path)
-end
+local function project_path_to_url(path) return SCHEME .. '/' .. clean_adapter_path(path) end
 
 local function with_meta(entry, overleaf_entry)
   local c = constants()
@@ -183,9 +175,9 @@ function M.read_file(bufnr)
     vim.bo[bufnr].modified = false
 
     local winid = vim.fn.bufwinid(bufnr)
-    vim.schedule(function()
-      require('overleaf').open_document(entry.id, entry.path, { winid = winid ~= -1 and winid or nil })
-    end)
+    vim.schedule(
+      function() require('overleaf').open_document(entry.id, entry.path, { winid = winid ~= -1 and winid or nil }) end
+    )
     return
   end
 

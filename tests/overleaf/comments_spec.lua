@@ -160,7 +160,10 @@ describe('comments', function()
     comments._doc_comments['doc-1'] = {}
     comments.render(bufnr, 'doc-1', content)
     assert.are.equal(0, #vim.diagnostic.get(bufnr, { namespace = comments._diag_ns }))
-    assert.are.equal(0, #vim.api.nvim_buf_get_extmarks(bufnr, comments._diag_sign_ns, 0, -1, { details = true, type = 'sign' }))
+    assert.are.equal(
+      0,
+      #vim.api.nvim_buf_get_extmarks(bufnr, comments._diag_sign_ns, 0, -1, { details = true, type = 'sign' })
+    )
   end)
 
   it('finds the comment under the cursor using character offsets', function()
@@ -199,144 +202,14 @@ describe('comments', function()
     assert.are.equal('δ', comment.content)
   end)
 
-  it('lists comments from unopened project documents through the Overleaf picker', function()
-    project._project_tree = {
-      { id = 'doc-1', path = 'main.tex', type = 'doc' },
-      { id = 'doc-2', path = 'sections/intro.tex', type = 'doc' },
-    }
-
-    local left_docs = {}
-    local picked
-    picker.locations = function(opts, locations, callback)
-      picked = {
-        opts = opts,
-        locations = locations,
-        callback = callback,
-      }
-    end
-
-    bridge.request = function(method, params, callback)
-      if method == 'getThreads' then
-        callback(nil, {
-          ['thread-1'] = {
-            resolved = false,
-            messages = {
-              {
-                content = 'Needs work',
-                user = { email = 'ada@example.com' },
-              },
-            },
-          },
-          ['thread-2'] = {
-            resolved = false,
-            messages = {
-              {
-                content = 'Clarify this',
-                user = { first_name = 'Grace' },
-              },
-            },
-          },
-        })
-      elseif method == 'joinDoc' and params.docId == 'doc-1' then
-        callback(nil, {
-          lines = { 'first', 'second line' },
-          ranges = {
-            comments = {
-              { op = { t = 'thread-1', p = 6, c = 'second' } },
-            },
-          },
-        })
-      elseif method == 'joinDoc' and params.docId == 'doc-2' then
-        callback(nil, {
-          lines = { 'intro one', 'please fix' },
-          ranges = {
-            comments = {
-              { op = { t = 'thread-2', p = 10, c = 'please' } },
-            },
-          },
-        })
-      elseif method == 'leaveDoc' then
-        left_docs[#left_docs + 1] = params.docId
-        callback(nil, {})
-      else
-        callback({ message = 'unexpected request: ' .. method }, nil)
-      end
-    end
-
-    comments.list_all('project-1')
-
-    vim.wait(1000, function() return picked ~= nil end)
-
-    assert.are.equal('Overleaf Comments', picked.opts.title)
-    assert.are.equal('select', picked.opts.fallback)
-    assert.are.equal(2, #picked.locations)
-    assert.are.equal('main.tex', picked.locations[1].path)
-    assert.are.equal(2, picked.locations[1].lnum)
-    assert.are.equal(1, picked.locations[1].col)
-    assert.are.equal('ada@example.com: Needs work', picked.locations[1].text)
-    assert.are.equal('thread-1', picked.locations[1].thread_id)
-
-    assert.are.equal('sections/intro.tex', picked.locations[2].path)
-    assert.are.equal(2, picked.locations[2].lnum)
-    assert.are.equal(1, picked.locations[2].col)
-    assert.are.equal('Grace: Clarify this', picked.locations[2].text)
-    assert.are.equal('thread-2', picked.locations[2].thread_id)
-    assert.are.same({ 'doc-1', 'doc-2' }, left_docs)
-  end)
-
-  it('keeps already-open documents joined when refreshing project comments', function()
-    project._project_tree = {
-      { id = 'doc-1', path = 'main.tex', type = 'doc' },
-    }
-    overleaf._state.documents['doc-1'] = {
-      joined = true,
-      content = 'first\nsecond line',
-      ranges = {
-        comments = {
-          { op = { t = 'thread-1', p = 6, c = 'second' } },
-        },
-      },
-    }
-
-    local leave_called = false
-    local join_called = false
-    bridge.request = function(method, params, callback)
-      if method == 'getThreads' then
-        callback(nil, {
-          ['thread-1'] = {
-            resolved = false,
-            messages = {
-              {
-                content = 'Needs work',
-                user = { email = 'ada@example.com' },
-              },
-            },
-          },
-        })
-      elseif method == 'joinDoc' then
-        join_called = true
-        callback({ message = 'joinDoc should not be called for active documents' }, nil)
-      elseif method == 'leaveDoc' then
-        leave_called = true
-        callback(nil, {})
-      else
-        callback({ message = 'unexpected request: ' .. method }, nil)
-      end
-    end
-
-    local done = false
-    comments.refresh_project_comments('project-1', function(err, stats)
-      assert.is_nil(err)
-      assert.are.equal(1, stats.total)
-      assert.are.equal(0, stats.failed)
-      done = true
-    end)
-
-    vim.wait(1000, function() return done end)
-    assert.is_true(done)
-    assert.is_false(join_called)
-    assert.is_false(leave_called)
-    assert.are.equal(1, #comments._doc_comments['doc-1'])
+  it('requires workspace ownership before fetching project comment ranges', function()
+    local request, calls = bridge.request, 0
+    bridge.request = function() calls = calls + 1 end
+    local failure
+    comments.refresh_project_comments('project', function(err) failure = err end)
+    bridge.request = request
+    assert.are.equal('NO_WORKSPACE', failure.code)
+    assert.are.equal(0, calls)
   end)
 
   it('builds comment quickfix entries from cached project comment snapshots', function()
@@ -367,9 +240,11 @@ describe('comments', function()
       },
     }
 
-    require('overleaf.picker').quickfix('Overleaf Comments', comments._comment_locations(), function(location)
-      require('overleaf').open_location(location)
-    end)
+    require('overleaf.picker').quickfix(
+      'Overleaf Comments',
+      comments._comment_locations(),
+      function(location) require('overleaf').open_location(location) end
+    )
 
     local items = vim.fn.getqflist()
     assert.are.equal(1, #items)

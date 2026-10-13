@@ -30,17 +30,13 @@ local function validate_path(path, opts)
 
   local components = vim.split(path:gsub('/+$', ''), '/', { plain = true, trimempty = true })
   for _, component in ipairs(components) do
-    if component == '' then
-      return nil, 'Path cannot contain empty components: ' .. path
-    end
+    if component == '' then return nil, 'Path cannot contain empty components: ' .. path end
     if component:find('\n', 1, true) or component:find('\r', 1, true) then
       return nil, 'Path cannot contain newlines: ' .. path
     end
   end
 
-  if opts.kind == 'name' and #components ~= 1 then
-    return nil, 'Name cannot contain /: ' .. path
-  end
+  if opts.kind == 'name' and #components ~= 1 then return nil, 'Name cannot contain /: ' .. path end
 
   return path
 end
@@ -61,18 +57,17 @@ local function local_path(doc_path)
   return dir .. '/' .. clean_path(doc_path)
 end
 
-local function mkdir_parent(path)
-  path = strip_trailing_slash(path)
-  local dir = vim.fn.fnamemodify(path, ':h')
-  vim.fn.mkdir(dir, 'p')
-end
-
 local function update_tree_views()
   pcall(function() require('overleaf.tree').refresh() end)
 end
 
 local function request(method, params, callback)
+  local context, owner = sync._workspace, state()
   bridge.request(method, params, function(err, result)
+    if sync._workspace ~= context or context.closing or state() ~= owner then
+      callback('Project changed while the remote operation was pending; inspect the original project')
+      return
+    end
     if err then
       callback(err.message or tostring(err))
     else
@@ -91,7 +86,7 @@ local function auth_params()
 end
 
 local function ensure_connected(callback)
-  if not state().connected then
+  if not sync._workspace or sync._workspace.closing or not state().connected then
     callback('Not connected to an Overleaf project')
     return false
   end
@@ -100,21 +95,35 @@ end
 
 function M.sync_project(callback)
   callback = callback or function() end
-  if not ensure_connected(callback) then return end
+  if not sync._workspace and not ensure_connected(callback) then return end
   if sync_in_progress then
     table.insert(sync_waiters, callback)
     return
   end
 
   sync_in_progress = true
-  sync.sync_all(state(), project._project_tree, function()
+  sync.sync_all(state(), project._project_tree, function(err)
     sync_in_progress = false
-    callback()
+    callback(err)
     local waiters = sync_waiters
     sync_waiters = {}
     for _, waiter in ipairs(waiters) do
-      waiter()
+      waiter(err)
     end
+  end)
+end
+
+local function reconcile_tree(callback, result)
+  require('overleaf')._save_project_tree(function(err)
+    if err then
+      callback('Remote operation completed, but local metadata could not be saved: ' .. err.message)
+      return
+    end
+    sync.sync_tree(project._project_tree, function(sync_error)
+      if sync_error then config.log('warn', '%s', sync_error.message) end
+      update_tree_views()
+      callback(nil, result)
+    end)
   end)
 end
 
@@ -122,9 +131,7 @@ function M.get_sync_dir() return sync.dir() end
 
 function M.local_path(path) return local_path(path) end
 
-function M.can_use_local_mirror()
-  return sync.dir() ~= nil
-end
+function M.can_use_local_mirror() return sync.dir() ~= nil end
 
 function M.create(path, entry_type, callback)
   callback = callback or function() end
@@ -166,32 +173,8 @@ function M.create(path, entry_type, callback)
     }
     if entry.id then project.add_entry(entry) end
 
-    local dest = local_path(normalized_path)
-    if dest then
-      if is_dir then
-        vim.fn.mkdir(dest, 'p')
-      else
-        mkdir_parent(dest)
-        if vim.fn.filereadable(dest) == 0 then vim.fn.writefile({}, dest) end
-      end
-    end
-
-    update_tree_views()
-    callback(nil, entry)
+    reconcile_tree(callback, entry)
   end)
-end
-
-local function update_open_doc_after_rename(doc_id, new_path)
-  local ol_state = state()
-  local doc = ol_state.documents[doc_id]
-  if not doc then return end
-
-  sync.unwatch(doc)
-  doc.path = new_path
-  if doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then
-    pcall(vim.api.nvim_buf_set_name, doc.bufnr, sync.buf_name(new_path))
-  end
-  sync.watch(doc)
 end
 
 function M.rename(src_path, dest_path, callback)
@@ -226,22 +209,6 @@ function M.rename(src_path, dest_path, callback)
     return
   end
 
-  local affected_docs = {}
-  if entry.type == 'folder' then
-    for _, child in ipairs(project._project_tree) do
-      if child.type == 'doc' and child.path:sub(1, #entry.path) == entry.path then
-        affected_docs[child.id] = child.path
-      end
-    end
-  elseif entry.type == 'doc' then
-    affected_docs[entry.id] = entry.path
-  end
-
-  for doc_id in pairs(affected_docs) do
-    local doc = state().documents[doc_id]
-    if doc then sync.unwatch(doc) end
-  end
-
   local params = auth_params()
   params.entityId = entry.id
   params.entityType = entry.type
@@ -249,37 +216,12 @@ function M.rename(src_path, dest_path, callback)
 
   request('renameEntity', params, function(err)
     if err then
-      for doc_id in pairs(affected_docs) do
-        local doc = state().documents[doc_id]
-        if doc then sync.watch(doc) end
-      end
       callback(err)
       return
     end
 
-    local old_path = entry.path
     local updated = project.rename_entry(entry.id, params.newName)
-
-    local old_local = local_path(old_path)
-    local new_local = local_path(normalized_dest)
-    if old_local and new_local and vim.fn.filereadable(old_local) + vim.fn.isdirectory(old_local) > 0 then
-      mkdir_parent(new_local)
-      pcall(vim.fn.rename, old_local, new_local)
-    end
-
-    if updated then
-      if entry.type == 'folder' then
-        for doc_id, previous_path in pairs(affected_docs) do
-          local new_doc_path = normalized_dest .. previous_path:sub(#old_path + 1)
-          update_open_doc_after_rename(doc_id, new_doc_path)
-        end
-      elseif entry.type == 'doc' then
-        update_open_doc_after_rename(entry.id, updated.path)
-      end
-    end
-
-    update_tree_views()
-    callback(nil, updated)
+    reconcile_tree(callback, updated)
   end)
 end
 
@@ -311,28 +253,7 @@ function M.delete(path, callback)
     end
 
     local removed = project.remove_entry_tree(entry.id)
-    for _, removed_entry in ipairs(removed) do
-      if removed_entry.type == 'doc' then
-        local doc = state().documents[removed_entry.id]
-        if doc then
-          sync.unwatch(doc)
-          doc:leave(function() require('overleaf.buffer').cleanup(doc) end)
-          state().documents[removed_entry.id] = nil
-        end
-      end
-    end
-
-    local target = local_path(entry.path)
-    if target then
-      if entry.type == 'folder' then
-        pcall(vim.fn.delete, target, 'rf')
-      else
-        pcall(vim.fn.delete, target)
-      end
-    end
-
-    update_tree_views()
-    callback(nil, removed)
+    reconcile_tree(callback, removed)
   end)
 end
 
@@ -384,15 +305,7 @@ function M.upload_file(file_path, parent_folder_id, callback)
     }
     if entry.id then project.add_entry(entry) end
 
-    local dest = local_path(remote_path)
-    if dest then
-      mkdir_parent(dest)
-      local ok, data = pcall(vim.fn.readfile, file_path, 'b')
-      if ok then pcall(vim.fn.writefile, data, dest, 'b') end
-    end
-
-    update_tree_views()
-    callback(nil, entry)
+    reconcile_tree(callback, entry)
   end)
 end
 

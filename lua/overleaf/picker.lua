@@ -9,9 +9,7 @@ local placeholder_jumping = {}
 local placeholder_seq = 0
 local uri_autocmds_installed = false
 
-local function location_key(lnum, col)
-  return ('%d:%d'):format(tonumber(lnum) or 1, tonumber(col) or 1)
-end
+local function location_key(lnum, col) return ('%d:%d'):format(tonumber(lnum) or 1, tonumber(col) or 1) end
 
 local function normalize_location(location)
   local ret = vim.deepcopy(location or {})
@@ -286,9 +284,7 @@ local function location_format(item, _picker)
   ret[#ret + 1] = { tostring(col), 'SnacksPickerCol' }
   ret[#ret + 1] = { ' ' }
 
-  if item.line then
-    require('snacks').picker.highlight.format(item, item.line, ret)
-  end
+  if item.line then require('snacks').picker.highlight.format(item, item.line, ret) end
 
   return ret
 end
@@ -302,13 +298,14 @@ local function qf_items(locations)
   for _, location in ipairs(locations) do
     local path = location.path or location.file
     if path then
-      local info = by_path[path] or {
-        max_lnum = 1,
-        lines = {},
-        location = location,
-        by_line = {},
-        by_key = {},
-      }
+      local info = by_path[path]
+        or {
+          max_lnum = 1,
+          lines = {},
+          location = location,
+          by_line = {},
+          by_key = {},
+        }
       local lnum = location.lnum or location.line or 1
       local col = location.col or 1
       info.max_lnum = math.max(info.max_lnum, lnum)
@@ -351,9 +348,7 @@ function M.ensure_list_buffer(location, info)
   local required_lnum = math.max(info and info.max_lnum or location.lnum or location.line or 1, 1)
   local bufnr = vim.fn.bufnr(name)
   if bufnr ~= -1 and vim.api.nvim_buf_is_valid(bufnr) and vim.b[bufnr].overleaf_qf_placeholder ~= true then
-    if vim.api.nvim_buf_is_loaded(bufnr) and vim.api.nvim_buf_line_count(bufnr) >= required_lnum then
-      return bufnr
-    end
+    if vim.api.nvim_buf_is_loaded(bufnr) and vim.api.nvim_buf_line_count(bufnr) >= required_lnum then return bufnr end
 
     bufnr = vim.api.nvim_create_buf(true, false)
     vim.bo[bufnr].buftype = 'nofile'
@@ -413,9 +408,7 @@ local function open_location_list(title, locations, callback, opts)
   vim.keymap.set('n', 'q', '<cmd>' .. close_cmd .. '<CR>', { buffer = qf_buf, nowait = true })
 end
 
-local function open_quickfix(title, locations, callback)
-  open_location_list(title, locations, callback)
-end
+local function open_quickfix(title, locations, callback) open_location_list(title, locations, callback) end
 
 function M.quickfix(title, locations, callback, opts)
   open_location_list(title, locations, callback or function() end, opts)
@@ -476,9 +469,7 @@ local overleaf_list_actions = {
   loclist = picker_list_action('loclist'),
 }
 
-overleaf_actions = function(extra)
-  return vim.tbl_extend('force', overleaf_list_actions, extra or {})
-end
+overleaf_actions = function(extra) return vim.tbl_extend('force', overleaf_list_actions, extra or {}) end
 
 function M.locations(opts, locations, callback)
   opts = opts or {}

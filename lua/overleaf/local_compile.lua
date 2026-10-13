@@ -1,6 +1,8 @@
 local config = require('overleaf.config')
 local project = require('overleaf.project')
 local sync = require('overleaf.sync')
+local bridge = require('overleaf.bridge')
+local uv = vim.uv or vim.loop
 
 local M = {}
 
@@ -28,7 +30,7 @@ local function build_command(command, main_file)
     local result = {}
     local replaced = false
     for _, part in ipairs(command) do
-      local value = tostring(part):gsub('{main}', main_file)
+      local value = tostring(part):gsub('{main}', function() return main_file end)
       if value ~= part then replaced = true end
       table.insert(result, value)
     end
@@ -38,7 +40,7 @@ local function build_command(command, main_file)
 
   command = tostring(command or '')
   if command:find('{main}', 1, true) then
-    return command:gsub('{main}', vim.fn.shellescape(main_file))
+    return command:gsub('{main}', function() return vim.fn.shellescape(main_file) end)
   end
   return command .. ' ' .. vim.fn.shellescape(main_file)
 end
@@ -67,6 +69,8 @@ end
 
 local function pdf_path(root_dir, main_file)
   local stem = vim.fn.fnamemodify(main_file, ':r')
+  local at_root = root_dir .. '/' .. vim.fn.fnamemodify(stem, ':t') .. '.pdf'
+  if uv.fs_stat(at_root) then return at_root end
   return root_dir .. '/' .. stem .. '.pdf'
 end
 
@@ -86,16 +90,10 @@ local function open_pdf(path)
   vim.fn.jobstart({ opener, path }, { detach = true })
 end
 
-local function flush_documents(state)
-  for _, doc in pairs(state.documents or {}) do
-    sync.write_doc(doc)
-  end
-end
-
-function M.compile(state, callback)
-  local root_dir = sync.dir()
-  if not root_dir then
-    callback({ message = 'Local compile requires sync_dir to be configured and active' })
+local function compile(state, callback, watch)
+  local context = sync._workspace
+  if not context then
+    callback({ message = 'Open a project workspace before compiling' })
     return
   end
 
@@ -105,123 +103,170 @@ function M.compile(state, callback)
     return
   end
 
-  flush_documents(state)
-
-  local cfg = compile_config()
-  local command = cfg.local_command or { 'latexmk', '-pdf', '-interaction=nonstopmode', '-synctex=1' }
-  local job_cmd = build_command(command, main_file)
-  local output = {}
-
-  config.log('debug', 'Local compile command: %s', shell_join(job_cmd))
-
-  local job_id = vim.fn.jobstart(job_cmd, {
-    cwd = root_dir,
-    stdout_buffered = true,
-    stderr_buffered = true,
-    on_stdout = function(_, data)
-      if data then vim.list_extend(output, data) end
-    end,
-    on_stderr = function(_, data)
-      if data then vim.list_extend(output, data) end
-    end,
-    on_exit = function(_, code)
-      local log = table.concat(output, '\n')
-      if code == 0 then
-        callback(nil, {
-          status = 'success',
-          log = log,
-          pdf_path = pdf_path(root_dir, main_file),
-        })
-      else
-        callback({
-          message = string.format('Local compile failed with exit code %d', code),
-          log = log,
-        })
-      end
-    end,
-  })
-
-  if job_id <= 0 then
-    callback({ message = 'Failed to start local compile command: ' .. shell_join(job_cmd) })
+  local cfg = vim.deepcopy(compile_config())
+  local function current()
+    return sync._workspace == context and not context.closing and (not watch or M._watch == watch)
   end
+  sync.reconcile(function(reconcile_error)
+    if not current() then
+      return callback({ code = 'SESSION_CLOSED', message = 'Project changed before compilation' })
+    end
+    if reconcile_error then return callback(reconcile_error) end
+    bridge.request('syncCaptureBuild', {
+      session = context.session,
+      previousFingerprint = watch and watch.main == main_file and watch.fingerprint or nil,
+    }, function(err, build)
+      if not current() then
+        return callback({ code = 'SESSION_CLOSED', message = 'Project changed during input capture' })
+      end
+      if err then return callback(err) end
+      if build.unchanged then return callback(nil, { status = 'unchanged' }) end
+      local function finish()
+        bridge.request('syncFinishBuild', { session = context.session, token = build.token }, function(finish_error)
+          if finish_error and current() then config.log('warn', 'Build retained: %s', finish_error.message) end
+        end)
+      end
+      local known = false
+      for _, input in ipairs(build.inputs) do
+        if input.path == main_file then
+          known = true
+          break
+        end
+      end
+      if not known then
+        finish()
+        return callback({ message = 'Main file is not a captured project source: ' .. main_file })
+      end
+      if watch then
+        watch.fingerprint, watch.main = build.fingerprint, main_file
+      end
+      local command = cfg.local_command or { 'latexmk', '-pdf', '-interaction=nonstopmode', '-synctex=1' }
+      local job_cmd, output = build_command(command, main_file), {}
+      config.log('debug', 'Local compile command: %s', shell_join(job_cmd))
+      local job_id = vim.fn.jobstart(job_cmd, {
+        cwd = build.directory,
+        stdout_buffered = true,
+        stderr_buffered = true,
+        on_stdout = function(_, data)
+          if data then vim.list_extend(output, data) end
+        end,
+        on_stderr = function(_, data)
+          if data then vim.list_extend(output, data) end
+        end,
+        on_exit = function(_, code)
+          finish()
+          if watch then
+            watch.job, M._watch_job_id = nil, nil
+          end
+          if not current() then
+            return callback({ code = 'SESSION_CLOSED', message = 'Project changed during compilation' })
+          end
+          local log = table.concat(output, '\n')
+          if code == 0 then
+            callback(nil, {
+              status = 'success',
+              log = log,
+              pdf_path = pdf_path(build.directory, main_file),
+              directory = build.directory,
+              fingerprint = build.fingerprint,
+            })
+          else
+            callback({ message = string.format('Local compile failed with exit code %d', code), log = log })
+          end
+        end,
+      })
+      if job_id <= 0 then
+        finish()
+        callback({ message = 'Failed to start local compile command: ' .. shell_join(job_cmd) })
+      elseif watch then
+        watch.job, M._watch_job_id = job_id, job_id
+      end
+    end)
+  end)
 end
 
-function M.open_pdf(path)
-  open_pdf(path)
-end
+function M.compile(state, callback) compile(state, callback) end
+
+function M.open_pdf(path) open_pdf(path) end
 
 function M.start_watch(state)
-  if M._watch_job_id then
+  if M._watch then
     config.log('info', 'Local compile watch is already running')
     return
   end
 
-  local root_dir = sync.dir()
-  if not root_dir then
-    config.log('warn', 'Local compile watch requires sync_dir to be configured and active')
+  local context = sync._workspace
+  if not context then
+    config.log('warn', 'Open a project workspace before watching saved changes')
     return
   end
 
-  local main_file = find_main_file(state)
-  if not main_file then
-    config.log('warn', 'Could not determine the main .tex file; set compile.main_file')
+  if compile_config().local_watch_command then
+    config.log(
+      'warn',
+      'Compile watch uses saved snapshots; configure a one-shot compile.local_command instead of local_watch_command'
+    )
     return
   end
-
-  flush_documents(state)
-
-  local cfg = compile_config()
-  local command = cfg.local_watch_command
-    or { 'latexmk', '-pdf', '-pvc', '-interaction=nonstopmode', '-synctex=1' }
-  local job_cmd = build_command(command, main_file)
-
-  config.log('info', 'Starting local compile watch: %s', shell_join(job_cmd))
-  local job_id = vim.fn.jobstart(job_cmd, {
-    cwd = root_dir,
-    on_stdout = function(_, data)
-      if cfg.watch_log == true and data then
-        for _, line in ipairs(data) do
-          if line ~= '' then config.log('debug', '[latexmk] %s', line) end
+  local watch = { context = context }
+  M._watch = watch
+  function watch.tick()
+    if M._watch ~= watch or watch.busy then return end
+    if sync._workspace ~= context or context.closing then return M.stop_watch({ silent = true }) end
+    watch.busy = true
+    compile(state, function(err, result)
+      watch.busy = false
+      if M._watch ~= watch then return end
+      if err then
+        if watch.error ~= err.message then config.log('warn', '%s', err.message) end
+        watch.error = err.message
+        return
+      end
+      watch.error = nil
+      if result.status == 'unchanged' then return end
+      if compile_config().watch_log then config.log('debug', '%s', result.log) end
+      local destination = context.directory .. '/builds/watch-output.pdf'
+      -- Compiler output stays private. Atomic publication gives PDF viewers a
+      -- stable path while each compilation reads its own saved input snapshot.
+      if uv.fs_stat(result.pdf_path) then
+        local temporary = result.directory .. '/.watch-output.pdf'
+        local copied, copy_error = uv.fs_copyfile(result.pdf_path, temporary, 1)
+        local installed, install_error
+        if copied then
+          installed, install_error = uv.fs_rename(temporary, destination)
+        end
+        if not installed then
+          config.log('warn', 'Cannot publish compiled PDF: %s', copy_error or install_error)
+          return
+        end
+        result.pdf_path = destination
+        if not watch.opened then
+          open_pdf(destination)
+          watch.opened = true
         end
       end
-    end,
-    on_stderr = function(_, data)
-      if cfg.watch_log == true and data then
-        for _, line in ipairs(data) do
-          if line ~= '' then config.log('debug', '[latexmk] %s', line) end
-        end
-      end
-    end,
-    on_exit = function(_, code)
-      M._watch_job_id = nil
-      if code ~= 0 then config.log('warn', 'Local compile watch exited with code %d', code) end
-    end,
-  })
-
-  if job_id <= 0 then
-    config.log('error', 'Failed to start local compile watch: %s', shell_join(job_cmd))
-    return
+      watch.result = result
+    end, watch)
   end
-
-  M._watch_job_id = job_id
-
-  vim.defer_fn(function() open_pdf(pdf_path(root_dir, main_file)) end, 1000)
+  watch.timer = vim.fn.timer_start(2000, function() watch.tick() end, { ['repeat'] = -1 })
+  watch.tick()
+  config.log('info', 'Watching saved project inputs for local compilation')
 end
 
 function M.stop_watch(opts)
   opts = opts or {}
-  if not M._watch_job_id then
+  local watch = M._watch
+  if not watch then
     if not opts.silent then config.log('info', 'Local compile watch is not running') end
     return
   end
 
-  vim.fn.jobstop(M._watch_job_id)
-  M._watch_job_id = nil
+  M._watch, M._watch_job_id = nil, nil
+  vim.fn.timer_stop(watch.timer)
+  if watch.job then vim.fn.jobstop(watch.job) end
   config.log('info', 'Stopped local compile watch')
 end
 
-function M.is_watch_running()
-  return M._watch_job_id ~= nil
-end
+function M.is_watch_running() return M._watch ~= nil end
 
 return M

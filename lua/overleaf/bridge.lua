@@ -9,6 +9,7 @@ M._event_handlers = {} -- event_name -> handler[]
 M._buffer = ''
 M._started = false
 M._stopping = false
+M._exiting = false
 M._on_unexpected_exit = nil -- callback for auto-reconnect
 M._stderr_tail = {}
 
@@ -23,7 +24,7 @@ local function exit_message()
 end
 
 function M.start(callback)
-  if M._stopping then
+  if M._stopping or M._exiting then
     if callback then callback({ code = 'STOPPING', message = 'Bridge is draining accepted requests' }) end
     return
   end
@@ -67,12 +68,18 @@ function M.start(callback)
       for _, pending in pairs(M._pending) do
         if pending.timer then vim.fn.timer_stop(pending.timer) end
         if pending.callback then
-          vim.schedule(function() pending.callback({ code = 'BRIDGE_DIED', message = exit_message() }, nil) end)
+          vim.schedule(function()
+            if not M._exiting then pending.callback({ code = 'BRIDGE_DIED', message = exit_message() }, nil) end
+          end)
         end
       end
       M._pending = {}
       -- Trigger auto-restart if bridge died unexpectedly
-      if unexpected and M._on_unexpected_exit then vim.schedule(function() M._on_unexpected_exit(code) end) end
+      if unexpected and M._on_unexpected_exit then
+        vim.schedule(function()
+          if not M._exiting and M._on_unexpected_exit then M._on_unexpected_exit(code) end
+        end)
+      end
     end,
     stdout_buffered = false,
     stderr_buffered = false,
@@ -105,8 +112,33 @@ end
 
 function M.is_running() return M._job_id ~= nil and M._started end
 
+vim.api.nvim_create_autocmd('VimLeavePre', {
+  group = vim.api.nvim_create_augroup('OverleafBridgeExit', { clear = true }),
+  desc = 'Drain accepted recovery writes before Neovim terminates the bridge',
+  callback = function()
+    local editor = package.loaded['overleaf.editor.session']
+    if editor then editor.stop_all() end
+    M._exiting = true
+    local job = M._job_id
+    if not job then return end
+    M.stop()
+    local reported = false
+    -- Final exit cannot be cancelled here. Keep processing job IO until Node
+    -- closes its stores; a deadline must not turn a slow write into an abrupt
+    -- termination. The bridge separately bounds stalled network requests.
+    while M._job_id == job do
+      local result = vim.fn.jobwait({ job }, 1000)[1]
+      if result >= 0 or result == -3 then break end
+      if M._job_id == job and not reported then
+        reported = true
+        pcall(vim.notify, '[overleaf] Waiting for recovery writes before exit...', vim.log.levels.INFO)
+      end
+    end
+  end,
+})
+
 function M.request(method, params, callback)
-  if M._stopping then
+  if M._stopping or M._exiting then
     if callback then callback({ code = 'STOPPING', message = 'Bridge is draining accepted requests' }, nil) end
     return
   end
@@ -124,12 +156,16 @@ function M.request(method, params, callback)
     params = params or {},
   })
 
-  -- Set timeout (30s)
-  local timer = vim.fn.timer_start(30000, function()
+  -- Compilation includes acknowledgement, HTTP compilation, and log download.
+  -- Each phase has its own bridge deadline; allow their combined duration.
+  local timeout = (method == 'syncCompile' or method == 'compile') and 90000 or 30000
+  local timer = vim.fn.timer_start(timeout, function()
     local pending = M._pending[id]
     M._pending[id] = nil
-    if pending and pending.callback then
-      vim.schedule(function() pending.callback({ code = 'TIMEOUT', message = method .. ' timed out' }, nil) end)
+    if pending and pending.callback and not M._exiting then
+      vim.schedule(function()
+        if not M._exiting then pending.callback({ code = 'TIMEOUT', message = method .. ' timed out' }, nil) end
+      end)
     end
   end)
 
@@ -182,7 +218,11 @@ function M._handle_message(line)
     M._pending[msg.id] = nil
     if pending then
       if pending.timer then vim.fn.timer_stop(pending.timer) end
-      if pending.callback then vim.schedule(function() pending.callback(msg.error, msg.result) end) end
+      if pending.callback then
+        vim.schedule(function()
+          if not M._exiting then pending.callback(msg.error, msg.result) end
+        end)
+      end
     end
     return
   end
@@ -192,6 +232,7 @@ function M._handle_message(line)
     local handlers = M._event_handlers[msg.event]
     if handlers then
       vim.schedule(function()
+        if M._exiting then return end
         for _, handler in ipairs(handlers) do
           handler(msg.data)
         end

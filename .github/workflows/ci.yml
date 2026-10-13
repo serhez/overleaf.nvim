@@ -22,8 +22,17 @@ jobs:
           version: latest
           args: --check lua/ tests/ plugin/
 
-  test-node:
-    runs-on: ubuntu-latest
+  test:
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.neovim == 'nightly' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        neovim: [v0.10.4, v0.11.5, stable]
+        include:
+          - os: ubuntu-latest
+            neovim: nightly
     steps:
       - uses: actions/checkout@v4
 
@@ -32,28 +41,18 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install bridge dependencies
-        run: cd node && npm install
-
-      - name: Install test dependencies
-        run: cd tests/node && npm install
-
-      - name: Run integration tests
-        run: node tests/node/integration.test.js
-
-  test-lua:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        neovim: [stable, nightly]
-    steps:
-      - uses: actions/checkout@v4
-
       - name: Install Neovim
         uses: rhysd/action-setup-vim@v1
         with:
           neovim: true
           version: ${{ matrix.neovim }}
 
-      - name: Run Lua tests
-        run: make test-lua
+      - name: Install bridge dependencies
+        run: npm install --prefix node
+
+      - name: Install Linux ACL test tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y acl
+
+      - name: Run Lua, synchronization, and bridge tests
+        run: make test

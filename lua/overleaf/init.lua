@@ -1,10 +1,7 @@
 local config = require('overleaf.config')
 local bridge = require('overleaf.bridge')
 local project = require('overleaf.project')
-local Document = require('overleaf.document')
-local buffer = require('overleaf.buffer')
 local sync = require('overleaf.sync')
-local ot = require('overleaf.ot')
 
 local M = {}
 
@@ -54,9 +51,7 @@ local function current_document()
   return bufnr, nil, nil
 end
 
-local function clamp_col(line, col)
-  return math.max(0, math.min(tonumber(col) or 0, #(line or '')))
-end
+local function clamp_col(line, col) return math.max(0, math.min(tonumber(col) or 0, #(line or ''))) end
 
 local function next_utf8_col(line, col)
   line = line or ''
@@ -78,7 +73,7 @@ local function next_utf8_col(line, col)
   return math.min(col + len, #line)
 end
 
-local function selected_text_range(bufnr, doc_content)
+local function selected_text_range(bufnr)
   local start_pos = vim.fn.getpos("'<")
   local end_pos = vim.fn.getpos("'>")
   if not start_pos or not end_pos or start_pos[2] == 0 or end_pos[2] == 0 then
@@ -120,10 +115,10 @@ local function selected_text_range(bufnr, doc_content)
   local text = table.concat(lines, '\n')
   if text == '' then return nil, 'Visual selection is empty' end
 
-  local byte_offset = ot.pos_to_byte_offset(doc_content or '', start_row, start_col)
   return {
     text = text,
-    offset = ot.byte_to_char(doc_content or '', byte_offset),
+    start = { row = start_row, col = start_col },
+    finish = { row = end_row, col = end_col },
   }
 end
 
@@ -163,7 +158,7 @@ M._state = {
   csrf_token = nil,
   user_id = nil,
   user_email = nil,
-  documents = {}, -- doc_id -> Document
+  documents = {}, -- doc_id -> owned workspace document
 }
 
 function M.is_overleaf_context(bufnr)
@@ -193,15 +188,11 @@ function M.is_overleaf_context(bufnr)
 end
 
 function M.cleanup_buffers()
-  for _, doc in pairs(M._state.documents) do
-    doc.bufnr = nil
-  end
-
   for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
-    if vim.api.nvim_buf_is_valid(bufnr) then
+    if vim.api.nvim_buf_is_valid(bufnr) and not vim.bo[bufnr].modified then
       local name = vim.api.nvim_buf_get_name(bufnr)
-      if name:match('^overleaf://') or name:match('^overleaf%-qf://') or name:match('^canola%-overleaf://') then
-        pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+      if name:match('^overleaf%-qf://') or name:match('^canola%-overleaf://') then
+        pcall(vim.api.nvim_buf_delete, bufnr, { force = false })
       end
     end
   end
@@ -221,17 +212,6 @@ function M._reset_project_session()
   sync.stop()
   pcall(function() require('overleaf.cursors').clear_all() end)
   pcall(function() require('overleaf.comments').clear_all() end)
-
-  for _, doc in pairs(M._state.documents) do
-    if doc._flush_timer then
-      vim.fn.timer_stop(doc._flush_timer)
-      doc._flush_timer = nil
-    end
-    doc.joined = false
-    doc.inflight_op = nil
-    doc.pending_ops = nil
-    doc._rejoining = false
-  end
 
   M.cleanup_buffers()
   M._state.connected = false
@@ -311,16 +291,25 @@ function M._get_cookie(callback)
 
     local function extract_from_profile(profile)
       config.log('info', 'Extracting cookie from %s (%s)...', profile.browserName, profile.dir)
-      bridge.request('getCookie', { browser = profile.browser, profile = profile.dir }, function(cookie_err, cookie_result)
-        if not cookie_err and cookie_result and cookie_result.cookie then
-          config.log('info', 'Cookie extracted from %s', profile.browserName)
-          config.get().cookie = cookie_result.cookie
-          callback(cookie_result.cookie)
-          return
+      bridge.request(
+        'getCookie',
+        { browser = profile.browser, profile = profile.dir },
+        function(cookie_err, cookie_result)
+          if not cookie_err and cookie_result and cookie_result.cookie then
+            config.log('info', 'Cookie extracted from %s', profile.browserName)
+            config.get().cookie = cookie_result.cookie
+            callback(cookie_result.cookie)
+            return
+          end
+          config.log(
+            'debug',
+            '%s extraction failed: %s',
+            profile.browserName,
+            cookie_err and cookie_err.message or 'unknown'
+          )
+          M._get_cookie_fallback(callback)
         end
-        config.log('debug', '%s extraction failed: %s', profile.browserName, cookie_err and cookie_err.message or 'unknown')
-        M._get_cookie_fallback(callback)
-      end)
+      )
     end
 
     if #profiles == 1 then
@@ -352,174 +341,179 @@ function M._get_cookie_fallback(callback)
   callback(nil)
 end
 
-function M._connect_project(cookie, project_id, project_name)
-  if M._state.project_id and M._state.project_id ~= project_id then
-    config.log('info', 'Switching Overleaf projects; clearing old project buffers')
-    M._reset_project_session()
+function M._save_project_tree(callback)
+  callback = callback or function(err)
+    if err then config.log('error', '%s', err.message) end
   end
+  local context = sync._workspace
+  if not context then return callback({ code = 'NO_WORKSPACE', message = 'No active workspace' }) end
+  local metadata = {
+    name = M._state.project_name or context.name or '',
+    tree = vim.deepcopy(project._project_tree),
+    data = M._state.project_data,
+  }
+  bridge.request('syncProject', { session = context.session, project = metadata }, function(err, reply)
+    if sync._workspace ~= context then return end
+    if not err then context.project = reply.project end
+    callback(err)
+  end)
+end
 
-  config.log('info', 'Connecting to project: %s', project_name)
-
-  -- Register event handlers before connecting
+function M._connect_project(cookie, project_id, project_name, options)
+  options = vim.tbl_extend('force', options or {}, { projectId = project_id, name = project_name })
+  config.get().cookie = cookie
+  M._connection_generation = (M._connection_generation or 0) + 1
+  local generation = M._connection_generation
+  local function current() return M._connection_generation == generation end
+  M._state.manual_disconnect, M._state.connected = true, false
+  if M._reconnect.timer then vim.fn.timer_stop(M._reconnect.timer) end
+  M._reconnect.timer, M._reconnect.attempt, M._reconnect.in_progress = nil, 0, false
+  pcall(function() require('overleaf.local_compile').stop_watch({ silent = true }) end)
+  pcall(function() require('overleaf.cursors').clear_all() end)
+  pcall(function() require('overleaf.comments').clear_all() end)
   M._setup_event_handlers()
-
-  -- Set up bridge auto-restart on unexpected exit
-  bridge._on_unexpected_exit = function(code)
-    config.log('warn', 'Bridge process died (code %d), attempting reconnect...', code)
-    M._state.connected = false
-    M._reconnect.attempt = 0
-    M._attempt_reconnect()
-  end
-
-  bridge.request('connect', {
-    cookie = cookie,
-    projectId = project_id,
-  }, function(err, result)
-    if err then
-      config.log('error', 'Failed to connect: %s', err.message)
+  config.log('info', 'Opening project: %s', project_name)
+  sync.open_workspace(options, function(workspace_error, context)
+    if not current() then return end
+    if workspace_error then
+      config.log('error', '%s', workspace_error.message)
+      if workspace_error.code == 'WORKSPACE_BUSY' and sync._failed_workspace then
+        local failed = sync._failed_workspace
+        vim.schedule(function()
+          if not current() then return end
+          local ok, err = pcall(require('overleaf.conflicts').locks, failed.params, {
+            on_recovered = function() M._connect_project(cookie, project_id, project_name, options) end,
+          })
+          if not ok then config.log('error', '%s', vim.inspect(err)) end
+        end)
+      end
       return
     end
-
-    M._state.connected = true
-    M._state.project_id = project_id
-    M._state.project_name = project_name
-    M._state.project_data = result.project
-
-    -- Parse project tree
-    project.parse_project_tree(result.project)
-
-    config.log('info', 'Connected to: %s', project_name)
-
-    -- Load comment threads
-    require('overleaf.comments').load_threads(project_id)
-
-    -- Start file sync (if sync_dir configured)
-    sync.start(project_name)
-    require('overleaf.ops').sync_project()
-
-    -- Show explorer immediately
-    vim.schedule(function() M.open_explorer() end)
-
-    local compile_cfg = config.get().compile or {}
-    if compile_cfg.backend == 'local' and compile_cfg.auto_start_watch == true then
-      require('overleaf.local_compile').start_watch(M._state)
+    M._state.project_id, M._state.project_name = project_id, project_name
+    M._state.documents = context.documents
+    M._state.project_data = context.project and context.project.data or nil
+    project._project_tree = context.project and vim.deepcopy(context.project.tree) or {}
+    bridge._on_unexpected_exit = function(code)
+      if not current() then return end
+      config.log('warn', 'Bridge exited (code %d); local buffers are retained', code)
+      M._state.connected = false
+      sync.network_disconnected()
+      M._reconnect.attempt = 0
+      M._attempt_reconnect()
     end
+    local function offline()
+      sync.sync_tree(project._project_tree, function()
+        if current() then M.open_explorer() end
+      end)
+    end
+    if not cookie or cookie == '' then
+      M._state.manual_disconnect = true
+      offline()
+      return
+    end
+    local function connect()
+      bridge.request('connect', { cookie = cookie, projectId = project_id }, function(err, result)
+        if not current() or sync._workspace ~= context then return end
+        M._state.manual_disconnect = false
+        if err then
+          config.log('warn', 'Project is offline: %s', err.message)
+          offline()
+          return
+        end
+        context.connected, M._state.connected = true, true
+        M._state.project_data = result.project
+        project.parse_project_tree(result.project)
+        M._save_project_tree(function(metadata_error)
+          if not current() then return end
+          if metadata_error then
+            config.log('error', '%s', metadata_error.message)
+            return
+          end
+          sync.sync_tree(project._project_tree, function(sync_error)
+            if not current() then return end
+            if sync_error then config.log('warn', '%s', sync_error.message) end
+            config.log('info', 'Connected to: %s', project_name)
+            require('overleaf.comments').load_threads(project_id)
+            M.open_explorer()
+            local cfg = config.get().compile or {}
+            if cfg.backend == 'local' and cfg.auto_start_watch == true then
+              require('overleaf.local_compile').start_watch(M._state)
+            end
+          end)
+        end)
+      end)
+    end
+    if M._state.csrf_token then
+      connect()
+      return
+    end
+    bridge.request('auth', { cookie = cookie }, function(auth_error, result)
+      if not current() or sync._workspace ~= context then return end
+      if auth_error or not result or not result.csrfToken then
+        config.log(
+          'warn',
+          'Project is offline: %s',
+          auth_error and auth_error.message or 'Authentication token unavailable'
+        )
+        offline()
+        return
+      end
+      M._state.csrf_token, M._state.user_id, M._state.user_email = result.csrfToken, result.userId, result.userEmail
+      if result.projects then project.set_projects(result.projects) end
+      connect()
+    end)
   end)
 end
 
 function M._setup_event_handlers()
-  bridge._event_handlers = {}
-
-  bridge.on_event('otUpdateApplied', function(data)
-    -- Skip own-ACK events (no op field = acknowledgment for our own op)
-    -- Our ACK is already handled by the applyOtUpdate callback → _on_ack()
-    if not data.op then return end
-
-    local doc = M._state.documents[data.doc]
-    if doc then
-      doc:on_remote_op(data, function(transformed_ops)
-        buffer.apply_remote(doc, transformed_ops)
-        sync.schedule_write(doc)
+  for name, handler in pairs(M._connection_handlers or {}) do
+    bridge.off_event(name, handler)
+  end
+  M._connection_handlers = {}
+  local function on_event(name, handler)
+    M._connection_handlers[name] = handler
+    bridge.on_event(name, handler)
+  end
+  local function refresh_tree()
+    local context = sync._workspace
+    if context then
+      M._save_project_tree(function(err)
+        if sync._workspace ~= context or context.closing then return end
+        if err then
+          config.log('error', '%s', err.message)
+          return
+        end
+        sync.sync_tree(project._project_tree, function(sync_error)
+          if sync._workspace ~= context or context.closing then return end
+          if sync_error then config.log('warn', '%s', sync_error.message) end
+        end)
       end)
-
-      local comments = require('overleaf.comments')
-      comments.on_comment_ops(data.doc, data.op)
-      if doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) and doc.content then
-        comments.render(doc.bufnr, data.doc, doc.content)
-      end
     end
-  end)
+    vim.schedule(function() require('overleaf.tree').refresh() end)
+  end
 
-  bridge.on_event('otUpdateError', function(data)
-    config.log('debug', 'OT Error for doc %s: %s', data.doc or '?', data.message or '?')
-    -- Only rejoin if connected (disconnect handler handles reconnect separately)
-    if M._state.connected then
-      local doc = M._state.documents[data.doc]
-      if doc and not doc._rejoining then doc:rejoin() end
-    end
-  end)
-
-  bridge.on_event('disconnect', function(data)
+  on_event('disconnect', function(data)
+    if M._state.manual_disconnect then return end
     if M._state.connected then config.log('warn', 'Disconnected: %s — reconnecting...', data.reason or 'unknown') end
     M._state.connected = false
+    sync.network_disconnected()
     M._attempt_reconnect()
   end)
 
   -- File tree events
-  bridge.on_event('reciveNewDoc', function(data)
+  on_event('reciveNewDoc', function(data)
     if not data or not data.doc then return end
     local doc_info = data.doc
     local meta = data.meta or {}
     local new_id = doc_info._id or doc_info.id
 
-    -- File-restore: remap old doc to new ID and rejoin
-    if meta.kind == 'file-restore' then
-      local old_id = M._pending_restore and M._pending_restore[meta.path or '']
-      if old_id then
-        M._pending_restore[meta.path] = nil
-        config.log('info', 'File restore: remapping %s -> %s (%s)', old_id, new_id, meta.path or '?')
-
-        -- Update tree entry ID
-        project.update_entry_id(old_id, new_id)
-
-        -- Remap open document to new ID
-        local old_doc = M._state.documents[old_id]
-        if old_doc then
-          M._state.documents[old_id] = nil
-          M._state.documents[new_id] = old_doc
-          old_doc.doc_id = new_id
-          old_doc.joined = false
-          old_doc.inflight_op = nil
-          old_doc.pending_ops = nil
-          if old_doc._flush_timer then
-            vim.fn.timer_stop(old_doc._flush_timer)
-            old_doc._flush_timer = nil
-          end
-
-          -- Immediately join the new doc (server already has it ready)
-          bridge.request('joinDoc', { docId = new_id }, function(err, result)
-            if err then
-              config.log('error', 'Failed to join restored doc %s: %s', meta.path or '?', err.message)
-              return
-            end
-
-            local content = table.concat(result.lines, '\n')
-            old_doc.version = result.version
-            old_doc.content = content
-            old_doc.server_content = content
-            old_doc.joined = true
-            old_doc._rejoining = false
-            old_doc.ranges = result.ranges
-
-            config.log('info', 'Restored doc %s (v%d)', meta.path or '?', result.version)
-
-            -- Update buffer with new content
-            if old_doc.bufnr and vim.api.nvim_buf_is_valid(old_doc.bufnr) then
-              vim.schedule(function()
-                old_doc.applying_remote = true
-                vim.api.nvim_buf_set_lines(old_doc.bufnr, 0, -1, false, result.lines)
-                vim.bo[old_doc.bufnr].modified = false
-                old_doc.applying_remote = false
-
-                -- Re-render comments if available
-                if result.ranges then
-                  local comments = require('overleaf.comments')
-                  comments.parse_ranges(new_id, result.ranges)
-                  comments.render(old_doc.bufnr, new_id, old_doc.content)
-                end
-              end)
-            end
-          end)
-        end
-      end
-
-      vim.schedule(function() require('overleaf.tree').refresh() end)
-      return
-    end
-
     -- Normal new doc (not restore)
     local parent_path = project.get_folder_path(data.parentFolderId)
     local path = parent_path .. (doc_info.name or '')
+    if sync._workspace and meta.kind == 'file-restore' then
+      local previous = project.get_entry_by_path(path)
+      if previous and previous.id ~= new_id then project.remove_entry(previous.id) end
+    end
     if not project.path_exists(path) then
       local depth = 0
       if data.parentFolderId then
@@ -538,10 +532,10 @@ function M._setup_event_handlers()
         depth = depth,
       })
     end
-    vim.schedule(function() require('overleaf.tree').refresh() end)
+    refresh_tree()
   end)
 
-  bridge.on_event('reciveNewFile', function(data)
+  on_event('reciveNewFile', function(data)
     if not data or not data.file then return end
     local file = data.file
     local parent_path = project.get_folder_path(data.parentFolderId)
@@ -564,12 +558,18 @@ function M._setup_event_handlers()
         depth = depth,
       })
     end
-    vim.schedule(function() require('overleaf.tree').refresh() end)
+    refresh_tree()
   end)
 
-  bridge.on_event('removeEntity', function(data)
+  on_event('removeEntity', function(data)
     if not data or not data.entityId then return end
     local meta = data.meta or {}
+
+    if sync._workspace then
+      project.remove_entry_tree(data.entityId)
+      refresh_tree()
+      return
+    end
 
     -- For file-restore, don't remove the entry — reciveNewDoc will remap it
     if meta.kind == 'file-restore' then
@@ -583,7 +583,52 @@ function M._setup_event_handlers()
     vim.schedule(function() require('overleaf.tree').refresh() end)
   end)
 
+  on_event('reciveEntityRename', function(data)
+    if not data or not data.entityId or not data.newName then return end
+    project.rename_entry(data.entityId, data.newName)
+    refresh_tree()
+  end)
+
+  on_event('reciveEntityMove', function(data)
+    if not data or not data.entityId then return end
+    project.move_entry(data.entityId, data.folderId)
+    refresh_tree()
+  end)
+
+  on_event('reciveNewFolder', function(data)
+    if not data or not data.folder then return end
+    local folder = data.folder
+    project.add_entry({
+      id = folder._id or folder.id,
+      name = folder.name,
+      type = 'folder',
+      path = project.get_folder_path(data.parentFolderId) .. folder.name .. '/',
+      depth = project.get_depth_for_parent(data.parentFolderId),
+    })
+    refresh_tree()
+  end)
+
+  on_event('projectNameUpdated', function(data)
+    if not data or type(data.name) ~= 'string' then return end
+    M._state.project_name = data.name
+    if sync._workspace then sync._workspace.name = data.name end
+    refresh_tree()
+  end)
+
+  on_event('rootDocUpdated', function(data)
+    if not data or not data.docId then return end
+    M._state.project_data = M._state.project_data or {}
+    M._state.project_data.rootDoc_id = data.docId
+    refresh_tree()
+  end)
+
   -- Comment events
+  local function schedule_feature(callback)
+    local context, state, generation = sync._workspace, M._state, M._connection_generation
+    vim.schedule(function()
+      if sync._workspace == context and M._state == state and M._connection_generation == generation then callback() end
+    end)
+  end
   local function rerender_comments()
     local comments = require('overleaf.comments')
     for doc_id, doc in pairs(M._state.documents) do
@@ -593,41 +638,41 @@ function M._setup_event_handlers()
     end
   end
 
-  bridge.on_event('newComment', function(data)
-    vim.schedule(function()
+  on_event('newComment', function(data)
+    schedule_feature(function()
       require('overleaf.comments').on_new_comment(data)
       rerender_comments()
     end)
   end)
 
-  bridge.on_event('resolveThread', function(data)
-    vim.schedule(function()
+  on_event('resolveThread', function(data)
+    schedule_feature(function()
       require('overleaf.comments').on_resolve_thread(data)
       rerender_comments()
     end)
   end)
 
-  bridge.on_event('reopenThread', function(data)
-    vim.schedule(function()
+  on_event('reopenThread', function(data)
+    schedule_feature(function()
       require('overleaf.comments').on_reopen_thread(data)
       rerender_comments()
     end)
   end)
 
-  bridge.on_event('deleteThread', function(data)
-    vim.schedule(function()
+  on_event('deleteThread', function(data)
+    schedule_feature(function()
       require('overleaf.comments').on_delete_thread(data)
       rerender_comments()
     end)
   end)
 
   -- Collaborator cursor tracking
-  bridge.on_event('clientUpdated', function(data)
-    vim.schedule(function() require('overleaf.cursors').on_client_updated(data) end)
+  on_event('clientUpdated', function(data)
+    schedule_feature(function() require('overleaf.cursors').on_client_updated(data) end)
   end)
 
-  bridge.on_event('clientDisconnected', function(data)
-    vim.schedule(function() require('overleaf.cursors').on_client_disconnected(data) end)
+  on_event('clientDisconnected', function(data)
+    schedule_feature(function() require('overleaf.cursors').on_client_disconnected(data) end)
   end)
 end
 
@@ -640,6 +685,7 @@ M._reconnect = {
 }
 
 function M._attempt_reconnect()
+  if M._state.manual_disconnect then return end
   if M._reconnect.in_progress then return end
   if M._state.connected then return end
   if not M._state.project_id then return end -- never connected
@@ -672,6 +718,7 @@ function M._attempt_reconnect()
 end
 
 function M._do_reconnect()
+  if M._state.manual_disconnect then return end
   local cookie = config.get().cookie
   if not cookie then
     config.log('error', 'No cookie available for reconnect')
@@ -689,7 +736,7 @@ function M._do_reconnect()
         return
       end
       M._setup_event_handlers()
-      M._reconnect_to_project(cookie)
+      M._connect_project(cookie, M._state.project_id, M._state.project_name)
     end)
   else
     M._reconnect_to_project(cookie)
@@ -697,10 +744,14 @@ function M._do_reconnect()
 end
 
 function M._reconnect_to_project(cookie)
+  local context, generation = sync._workspace, M._connection_generation
+  M._state.manual_disconnect = true
   bridge.request('connect', {
     cookie = cookie,
     projectId = M._state.project_id,
   }, function(err, result)
+    if sync._workspace ~= context or M._connection_generation ~= generation then return end
+    M._state.manual_disconnect = false
     M._reconnect.in_progress = false
 
     if err then
@@ -714,25 +765,32 @@ function M._reconnect_to_project(cookie)
     M._reconnect.attempt = 0
 
     config.log('info', 'Reconnected to: %s', M._state.project_name or '?')
-
-    -- Re-join all open documents (wait for server to settle after restore)
-    vim.defer_fn(function() M._rejoin_documents() end, 3000)
+    if context then
+      context.connected = true
+      project.parse_project_tree(result.project)
+      M._save_project_tree(function(metadata_error)
+        if sync._workspace ~= context or M._connection_generation ~= generation then return end
+        if metadata_error then
+          config.log('error', '%s', metadata_error.message)
+          return
+        end
+        sync.connect_documents(function(connection_error)
+          if sync._workspace ~= context or M._connection_generation ~= generation then return end
+          if connection_error then config.log('warn', '%s', connection_error.message) end
+          sync.sync_tree(project._project_tree, function(sync_error)
+            if sync._workspace ~= context or M._connection_generation ~= generation then return end
+            if sync_error then config.log('warn', '%s', sync_error.message) end
+          end)
+        end)
+      end)
+    else
+      M._rejoin_documents()
+    end
   end)
 end
 
 function M._rejoin_documents()
-  for _, doc in pairs(M._state.documents) do
-    if doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then
-      -- Stop delayed flushes; rejoin decides whether local buffer edits must be preserved.
-      doc._rejoining = false
-      doc.joined = false
-      if doc._flush_timer then
-        vim.fn.timer_stop(doc._flush_timer)
-        doc._flush_timer = nil
-      end
-      doc:rejoin()
-    end
-  end
+  if sync._workspace then sync.connect_documents() end
 end
 
 function M.open_document(doc_id_or_path, doc_path, opts)
@@ -740,7 +798,6 @@ function M.open_document(doc_id_or_path, doc_path, opts)
   local doc_id = doc_id_or_path
   local path = doc_path
   local target_win = opts.winid or vim.api.nvim_get_current_win()
-  local target_bufnr = opts.bufnr
   local target_line = tonumber(opts.lnum or opts.line)
   local target_col = tonumber(opts.col)
 
@@ -774,45 +831,19 @@ function M.open_document(doc_id_or_path, doc_path, opts)
     end
   end
 
-  -- Check if already open
-  if M._state.documents[doc_id] then
-    local existing = M._state.documents[doc_id]
-    if existing.bufnr and vim.api.nvim_buf_is_valid(existing.bufnr) then
-      in_target_window(function()
-        vim.api.nvim_set_current_buf(existing.bufnr)
-        jump_to_target()
-      end)
-      return
-    end
+  if sync._workspace then
+    sync.open_document({ id = doc_id, path = path }, opts, function(err, doc)
+      if err then
+        config.log('error', '%s', err.message)
+        return
+      end
+      M._state.documents[doc_id] = doc
+      in_target_window(jump_to_target)
+    end)
+    return
   end
 
-  local doc = Document.new(doc_id, path)
-  M._state.documents[doc_id] = doc
-
-  doc:join(function(err, lines, ranges)
-    if err then
-      M._state.documents[doc_id] = nil
-      return
-    end
-
-    in_target_window(function()
-      buffer.create(doc, lines, { bufnr = target_bufnr })
-      jump_to_target()
-    end)
-
-    -- Write to sync dir and start watching for external changes
-    sync.write_doc(doc)
-    sync.watch(doc)
-
-    -- Parse and render comments if ranges contain comments
-    if ranges then
-      local comments = require('overleaf.comments')
-      comments.parse_ranges(doc_id, ranges)
-      vim.schedule(function()
-        if doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then comments.render(doc.bufnr, doc_id, doc.content) end
-      end)
-    end
-  end)
+  config.log('warn', 'Open a project workspace before opening a document')
 end
 
 function M.open_location(location)
@@ -837,29 +868,42 @@ function M.open_location(location)
 end
 
 function M.projects()
-  if not bridge.is_running() or #project._projects == 0 then
-    M.connect()
-    return
-  end
-
-  project.select_project(function(project_id, project_name)
-    if M._state.connected and M._state.project_id == project_id then
-      config.log('info', 'Already connected to: %s', project_name)
-      M.open_explorer()
+  bridge.start(function(start_error)
+    if start_error then
+      config.log('error', '%s', start_error.message)
       return
     end
-
-    local cookie = config.get().cookie
-    M._connect_project(cookie, project_id, project_name)
+    bridge.request('syncListProjects', {
+      root = vim.fn.stdpath('state') .. '/overleaf/recovery',
+      server = config.get().base_url,
+    }, function(err, reply)
+      if err then config.log('warn', 'Could not read cached projects: %s', err.message) end
+      local items, known = {}, {}
+      for _, item in ipairs(reply and reply.projects or {}) do
+        items[#items + 1], known[item.projectId] = item, true
+      end
+      for _, item in ipairs(project._projects) do
+        if not known[item.id] then items[#items + 1] = { projectId = item.id, name = item.name } end
+      end
+      if #items == 0 then return M.connect() end
+      items[#items + 1] = { name = 'Connect to another project…', connect = true }
+      require('overleaf.picker').select(items, {
+        prompt = 'Select Overleaf Project:',
+        format_item = function(item) return item.name .. (item.sourceRoot and ' (available offline)' or '') end,
+      }, function(choice)
+        if not choice then return end
+        if choice.connect then return M.connect() end
+        if M._state.connected and M._state.project_id == choice.projectId then return M.open_explorer() end
+        M._connect_project(config.get().cookie, choice.projectId, choice.name, { sourceRoot = choice.sourceRoot })
+      end)
+    end)
   end)
 end
 
-function M.select_project()
-  M.projects()
-end
+function M.select_project() M.projects() end
 
 function M.select_document()
-  if not M._state.connected then
+  if not M._state.connected and not sync._workspace then
     config.log('warn', 'Not connected. Run :Overleaf projects first.')
     return
   end
@@ -868,7 +912,7 @@ function M.select_document()
 end
 
 function M.files(path)
-  if not M._state.connected then
+  if not M._state.connected and not sync._workspace then
     config.log('warn', 'Not connected. Run :Overleaf projects first.')
     return
   end
@@ -881,19 +925,17 @@ function M.files(path)
 end
 
 function M.open_explorer()
-  if not M._state.connected then
+  if not M._state.connected and not sync._workspace then
     config.log('warn', 'Not connected. Run :Overleaf projects first.')
     return
   end
   require('overleaf.explorer').open()
 end
 
-function M.toggle_tree()
-  M.open_explorer()
-end
+function M.toggle_tree() M.open_explorer() end
 
 function M.open_native_tree()
-  if not M._state.connected then
+  if not M._state.connected and not sync._workspace then
     config.log('warn', 'Not connected. Run :Overleaf projects first.')
     return
   end
@@ -1187,68 +1229,94 @@ function M._show_history(updates)
 end
 
 function M.compile()
-  if not M._state.connected then
-    config.log('warn', 'Not connected. Run :Overleaf projects first.')
-    return
-  end
-
   local compile_cfg = config.get().compile or {}
   if compile_cfg.backend == 'local' then
     M.compile_local()
     return
   end
+  if not M._state.connected then
+    config.log('warn', 'Not connected. Run :Overleaf projects first.')
+    return
+  end
 
-  config.log('info', 'Compiling...')
-
-  bridge.request('compile', {
-    cookie = config.get().cookie,
-    csrfToken = M._state.csrf_token,
-    projectId = M._state.project_id,
-  }, function(err, result)
-    if err then
-      config.log('error', 'Compile failed: %s', err.message)
+  local context = sync._workspace
+  if not context then
+    config.log('warn', 'Open a project workspace before compiling')
+    return
+  end
+  local connection = M._connection_generation
+  local token = {}
+  M._compile_token = token
+  local function current()
+    return sync._workspace == context
+      and not context.closing
+      and M._connection_generation == connection
+      and M._compile_token == token
+  end
+  config.log('info', 'Confirming saved revisions before compiling...')
+  sync.reconcile(function(reconcile_error)
+    if not current() then return end
+    if reconcile_error then
+      config.log('error', '%s', reconcile_error.message)
       return
     end
+    bridge.request('syncCompile', {
+      session = context.session,
+      cookie = config.get().cookie,
+      csrfToken = M._state.csrf_token,
+      projectId = M._state.project_id,
+    }, function(err, result)
+      if not current() then return end
+      if err then
+        config.log('error', 'Compile failed: %s', err.message)
+        return
+      end
 
-    if result.status == 'success' then
-      config.log('info', 'Compile succeeded')
-      -- Auto-download and open PDF
-      M._open_pdf(result.outputFiles or {})
-    else
-      config.log('warn', 'Compile status: %s', result.status)
-    end
+      if result.status == 'success' then
+        config.log('info', 'Compile succeeded')
+        -- Auto-download and open PDF
+        M._open_pdf(result.outputFiles or {})
+      else
+        config.log('warn', 'Compile status: %s', result.status)
+      end
 
-    vim.schedule(function() M._parse_compile_log(result.log or '') end)
+      vim.schedule(function()
+        if current() then M._parse_compile_log(result.log or '') end
+      end)
+    end)
   end)
 end
 
 function M.compile_local()
+  local context = sync._workspace
   config.log('info', 'Compiling locally...')
 
   require('overleaf.local_compile').compile(M._state, function(err, result)
+    if sync._workspace ~= context then return end
     if err then
       config.log('error', 'Local compile failed: %s', err.message)
-      vim.schedule(function() M._parse_compile_log(err.log or '') end)
+      vim.schedule(function()
+        if sync._workspace == context then M._parse_compile_log(err.log or '') end
+      end)
       return
     end
 
     config.log('info', 'Local compile succeeded')
     vim.schedule(function()
+      if sync._workspace ~= context then return end
       M._parse_compile_log(result.log or '')
       require('overleaf.local_compile').open_pdf(result.pdf_path)
     end)
   end)
 end
 
-function M.compile_watch()
-  require('overleaf.local_compile').start_watch(M._state)
-end
+function M.compile_watch() require('overleaf.local_compile').start_watch(M._state) end
 
-function M.stop_compile_watch()
-  require('overleaf.local_compile').stop_watch()
-end
+function M.stop_compile_watch() require('overleaf.local_compile').stop_watch() end
 
 function M._open_pdf(output_files)
+  local context, token = sync._workspace, M._compile_token
+  local function current() return sync._workspace == context and M._compile_token == token end
   local pdf_file = nil
   for _, f in ipairs(output_files) do
     if f.path == 'output.pdf' then
@@ -1259,19 +1327,24 @@ function M._open_pdf(output_files)
   if not pdf_file or not pdf_file.url then return end
 
   local pdf_url = resolve_url(config.get().base_url, pdf_file.url)
+  local name = vim.fn.strcharpart((M._state.project_name or 'output'):gsub('[%c/\\]', '_'), 0, 50)
+  local identity = vim.fn.sha256(config.get().base_url .. '\n' .. (M._state.project_id or '')):sub(1, 12)
   config.log('debug', 'Downloading PDF from %s', pdf_url)
 
   bridge.request('downloadUrl', {
     cookie = config.get().cookie,
     url = pdf_url,
-    fileName = (M._state.project_name or 'output') .. '.pdf',
+    fileName = name .. '-' .. identity .. '.pdf',
     outputDir = config.get().pdf_dir,
   }, function(err, result)
+    if not current() then return end
     if err then
       config.log('warn', 'PDF download failed from %s: %s', pdf_url, err.message)
       return
     end
-    vim.schedule(function() open_file(result.path) end)
+    vim.schedule(function()
+      if current() then open_file(result.path) end
+    end)
   end)
 end
 
@@ -1420,26 +1493,8 @@ function M.refresh_comments()
     return
   end
 
-  local comments = require('overleaf.comments')
-
-  -- Reload threads from API
-  comments.load_threads(M._state.project_id, function(err)
-    if err then return end
-
-    -- Re-join each open doc to get fresh ranges
-    for doc_id, doc in pairs(M._state.documents) do
-      if doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) and doc.joined then
-        bridge.request('joinDoc', { docId = doc_id }, function(join_err, result)
-          if join_err then return end
-          if result.ranges then comments.parse_ranges(doc_id, result.ranges) end
-          vim.schedule(function()
-            if doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then
-              comments.render(doc.bufnr, doc_id, doc.content)
-            end
-          end)
-        end)
-      end
-    end
+  require('overleaf.comments').refresh_project_comments(M._state.project_id, function(err)
+    if err then config.log('warn', '%s', err.message) end
   end)
 end
 
@@ -1513,63 +1568,81 @@ function M.create_comment_from_selection()
     config.log('warn', 'Document is not joined yet')
     return
   end
-  if doc.check_content and not doc:check_content({ recover_pending = true }) then return end
 
-  local selection, selection_err = selected_text_range(bufnr, doc.content)
+  local selection, selection_err = selected_text_range(bufnr)
   if not selection then
     config.log('warn', selection_err or 'No visual selection')
     return
   end
 
-  vim.ui.input({ prompt = 'Comment: ' }, function(content)
-    if not content or content == '' then return end
-
-    local thread_id = generate_comment_thread_id()
-    bridge.request('addComment', {
-      cookie = config.get().cookie,
-      csrfToken = M._state.csrf_token,
-      projectId = M._state.project_id,
-      threadId = thread_id,
-      content = content,
-    }, function(err, result)
-      if err then
-        config.log('error', 'Comment failed: %s', err.message)
+  if doc.engine and sync._workspace then
+    local context, state, tick = sync._workspace, M._state, vim.api.nvim_buf_get_changedtick(bufnr)
+    local view = doc.content
+    vim.ui.input({ prompt = 'Comment: ' }, function(content)
+      if not content or content == '' then return end
+      if
+        sync._workspace ~= context
+        or context.closing
+        or M._state ~= state
+        or state.documents[doc_id] ~= doc
+        or not vim.api.nvim_buf_is_valid(bufnr)
+        or vim.api.nvim_buf_get_changedtick(bufnr) ~= tick
+      then
+        config.log('warn', 'Selection or project changed; select the comment text again')
         return
       end
-
-      local message = type(result) == 'table' and (result.comment or result.message or result) or nil
-      local comments = require('overleaf.comments')
-      comments.add_local_thread(doc_id, thread_id, selection.offset, selection.text, content, {
-        id = M._state.user_id,
-        email = M._state.user_email,
-        first_name = 'You',
-      }, message)
-      comments._doc_contents[doc_id] = doc.content
-
-      doc.ranges = doc.ranges or {}
-      doc.ranges.comments = doc.ranges.comments or {}
-      table.insert(doc.ranges.comments, {
-        op = {
-          p = selection.offset,
-          c = selection.text,
-          t = thread_id,
+      bridge.request('syncComment', {
+        session = context.session,
+        document = doc_id,
+        cookie = config.get().cookie,
+        csrfToken = state.csrf_token,
+        selection = {
+          thread = generate_comment_thread_id(),
+          message = content,
+          view = view,
+          start = selection.start,
+          ['end'] = selection.finish,
         },
-      })
-
-      doc:submit_op({ {
-        p = selection.offset,
-        c = selection.text,
-        t = thread_id,
-      } })
-
-      vim.schedule(function()
-        if doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then
-          require('overleaf.comments').render(doc.bufnr, doc_id, doc.content)
+      }, function(err)
+        if sync._workspace ~= context or context.closing or M._state ~= state then return end
+        if doc.controller then doc.controller:refresh() end
+        if err then
+          config.log('error', '%s', err.message)
+          return
         end
+        config.log('info', 'Comment posted; synchronizing its text range')
+        local comments = require('overleaf.comments')
+        comments.load_threads(state.project_id, function(failure)
+          if not failure then comments.refresh_document(doc) end
+        end)
       end)
-      config.log('info', 'Comment added')
     end)
-  end)
+    return
+  end
+
+  config.log('warn', 'Open an owned workspace document before commenting')
+end
+
+function M.comment_drafts()
+  local buf, id, doc = current_document()
+  local context = sync._workspace
+  if not context or not doc or not doc.engine then
+    config.log('warn', 'Open an Overleaf source first')
+    return
+  end
+  local selection = selected_text_range(buf)
+  local view, tick = doc.content, vim.api.nvim_buf_get_changedtick(buf)
+  require('overleaf.comments').review_drafts(doc, context, selection and {
+    view = view,
+    start = selection.start,
+    ['end'] = selection.finish,
+    current = function()
+      return sync._workspace == context
+        and context.documents[id] == doc
+        and vim.api.nvim_buf_is_valid(buf)
+        and vim.api.nvim_buf_get_changedtick(buf) == tick
+    end,
+  } or nil)
 end
 
 function M.reply_comment()
@@ -1601,8 +1674,16 @@ function M.reply_comment()
     return
   end
 
+  local state, context, generation = M._state, sync._workspace, M._connection_generation
+  local function current()
+    return M._state == state
+      and state.connected
+      and M._connection_generation == generation
+      and sync._workspace == context
+      and state.documents[doc_id] == doc
+  end
   vim.ui.input({ prompt = 'Reply: ' }, function(content)
-    if not content or content == '' then return end
+    if not content or content == '' or not current() then return end
 
     bridge.request('addComment', {
       cookie = config.get().cookie,
@@ -1611,6 +1692,7 @@ function M.reply_comment()
       threadId = thread.id,
       content = content,
     }, function(err, _)
+      if not current() then return end
       if err then
         config.log('error', 'Reply failed: %s', err.message)
         return
@@ -1651,6 +1733,8 @@ function M.resolve_comment()
 
   config.log('debug', 'resolve_comment: threadId=%s resolved=%s', thread.id, tostring(thread.resolved))
 
+  local state, context = M._state, sync._workspace
+  local function current() return M._state == state and sync._workspace == context and state.documents[doc_id] == doc end
   if thread.resolved then
     bridge.request('reopenThread', {
       cookie = config.get().cookie,
@@ -1659,6 +1743,7 @@ function M.resolve_comment()
       docId = doc_id,
       threadId = thread.id,
     }, function(err, _)
+      if not current() then return end
       if err then
         config.log('error', 'Reopen failed: %s', err.message)
         return
@@ -1675,6 +1760,7 @@ function M.resolve_comment()
       docId = doc_id,
       threadId = thread.id,
     }, function(err, _)
+      if not current() then return end
       if err then
         config.log('error', 'Resolve failed: %s', err.message)
         return
@@ -1687,7 +1773,7 @@ function M.resolve_comment()
 end
 
 function M.sync_all()
-  if not M._state.connected then
+  if not M._state.connected and not sync._workspace then
     config.log('warn', 'Not connected.')
     return
   end
@@ -1695,7 +1781,7 @@ function M.sync_all()
 end
 
 function M.sync_import()
-  if not M._state.connected then
+  if not M._state.connected and not sync._workspace then
     config.log('warn', 'Not connected.')
     return
   end
@@ -1703,14 +1789,271 @@ function M.sync_import()
 end
 
 function M.sync_export()
-  if not M._state.connected then
+  if not M._state.connected and not sync._workspace then
     config.log('warn', 'Not connected.')
     return
   end
   sync.export_all(M._state)
 end
 
+--- Select both sides explicitly: legacy names never establish project identity.
+function M.migrate(directory, callback)
+  local context, capture = sync._workspace, nil
+  local function done(err, doc)
+    if capture then
+      capture.keep = err ~= nil
+      require('overleaf.editor.history').dispose(capture)
+    end
+    if callback then return callback(err, doc) end
+    if err then
+      config.log('error', '%s', type(err) == 'table' and err.message or tostring(err))
+    elseif doc then
+      config.log('info', 'Legacy version retained. Use :Overleaf resolve to review it before syncing.')
+    end
+  end
+  if not context then return done({ message = 'Open the destination project before migration' }) end
+  local function current() return sync._workspace == context and not context.closing end
+  local function choose_target(source)
+    if not current() then return done({ message = 'Project changed during migration' }) end
+    local targets = vim.tbl_filter(function(entry) return entry.type == 'doc' end, project._project_tree or {})
+    if #targets == 0 then return done({ message = 'The destination project has no text documents' }) end
+    vim.ui.select(targets, {
+      prompt = 'Import into project ' .. context.params.projectId .. ' at ' .. context.params.server .. ':',
+      format_item = function(entry) return entry.path .. ' [' .. entry.id .. ']' end,
+    }, function(target)
+      if not target then return done() end
+      if not current() then return done({ message = 'Project changed during migration' }) end
+      sync.open_document(target, {}, function(err, doc)
+        if err then return done(err) end
+        if not current() then return done({ message = 'Project changed during migration' }) end
+        local ok, result = pcall(function()
+          if capture then source.checkpoint = require('overleaf.editor.history').checkpoint(capture) end
+          return doc.controller:import_branch(source)
+        end)
+        if not ok then return done(result) end
+        if not current() then
+          return done({ message = 'Project changed; the imported branch remains in its recovery store' })
+        end
+        M._state.documents[doc.doc_id] = doc
+        done(nil, doc)
+      end)
+    end)
+  end
+  local function choose_source(inventory)
+    if not current() then return done({ message = 'Project changed during migration' }) end
+    local choices = {}
+    for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+      local name = vim.api.nvim_buf_get_name(buf)
+      if vim.api.nvim_buf_is_loaded(buf) and name:match('^overleaf://') and not vim.b[buf].overleaf_qf_placeholder then
+        choices[#choices + 1] = { kind = 'buffer', buf = buf, name = name }
+      end
+    end
+    for _, entry in ipairs(inventory and inventory.entries or {}) do
+      if entry.type ~= 'directory' then
+        choices[#choices + 1] = { kind = 'file', name = entry.path, filename = entry.filename, type = entry.type }
+      end
+    end
+    if #choices == 0 then
+      return done({ message = 'No legacy sources found; use :Overleaf migrate /old/project/directory' })
+    end
+    vim.ui.select(choices, {
+      prompt = 'Select a legacy source (originals are retained):',
+      format_item = function(entry) return '[' .. (entry.type or entry.kind) .. '] ' .. entry.name end,
+    }, function(choice)
+      if not choice then return done() end
+      if not current() then return done({ message = 'Project changed during migration' }) end
+      if choice.kind == 'file' then
+        if choice.type ~= 'file' then return done({ message = 'Only ordinary text files can be imported' }) end
+        bridge.request('syncLegacyRead', { filename = choice.filename }, function(err, source)
+          if err then return done(err) end
+          choose_target(source)
+        end)
+      else
+        local ok, result = pcall(require('overleaf.editor.history').capture, choice.buf, {
+          directory = context.directory .. '/editor-captures',
+          document = 'legacy:' .. choice.name,
+        })
+        if not ok then return done(result) end
+        capture = result
+        choose_target({ kind = 'buffer', name = choice.name })
+      end
+    end)
+  end
+  if directory then
+    bridge.request(
+      'syncLegacyInventory',
+      { directory = vim.fn.fnamemodify(vim.fn.expand(directory), ':p'):gsub('/$', '') },
+      function(err, inventory)
+        if err then return done(err) end
+        choose_source(inventory)
+      end
+    )
+  else
+    choose_source()
+  end
+end
+
+local function present(value) return value ~= nil and value ~= vim.NIL end
+
+local function document_state(doc) return (doc.controller and doc.controller.state) or doc.state or {} end
+
+local function held_reason(doc)
+  local state = document_state(doc)
+  if present(state.lifecycle) then return state.lifecycle.reason end
+  if present(state.conflict) then return state.conflict.reason or 'conflict' end
+  if present(state.held) then return state.held.reason end
+  if present(state.disk) and present(state.disk.held) then return state.disk.held.reason end
+  if present(state.transport) and state.transport.state == 'held' then return state.transport.reason end
+  if doc.scan_error or doc.transport_error then return (doc.scan_error or doc.transport_error).code end
+end
+
+local function document_status(doc)
+  local state = document_state(doc)
+  local local_status = doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) and vim.bo[doc.bufnr].modified and 'unsaved'
+    or 'saved locally'
+  local network = not M._state.connected and 'offline' or state.publication or 'connecting'
+  if state.publication == 'local-only' then network = 'local only' end
+  if network == 'pending' then network = 'awaiting sync' end
+  local reason = held_reason(doc)
+  return local_status .. ' | ' .. network .. (reason and (' | held: ' .. reason) or '')
+end
+
+function M.resolve(kind)
+  local _, _, doc = current_document()
+  if not doc or not doc.controller then
+    config.log('warn', 'Open a workspace document before resolving it')
+    return
+  end
+  local conflicts = require('overleaf.conflicts')
+  local state = document_state(doc)
+  local action = kind == 'history' and conflicts.history
+    or kind == 'disk-history' and conflicts.disk_history
+    or kind == 'recovery' and conflicts.recovery
+  if not action then
+    if present(state.lifecycle) and present(state.lifecycle.remotePath) then
+      action = function(controller)
+        return conflicts.relocation(controller, {
+          accept = function(review) return sync.relocate_document(doc, review) end,
+          local_choices = {
+            accept = function(review) return sync.keep_document_local(doc, review) end,
+            archive = function(review) return sync.relocate_document(doc, review, true) end,
+          },
+        })
+      end
+    elseif present(state.lifecycle) then
+      action = function(controller)
+        return conflicts.lifecycle(controller, {
+          accept = function(review) return sync.keep_document_local(doc, review) end,
+          archive = function(review) return sync.relocate_document(doc, review, true) end,
+        })
+      end
+    elseif present(state.conflict) then
+      action = state.publication == 'uncertain'
+          and function(controller)
+            return conflicts.upload(controller, {
+              detach = function(review) return sync.keep_document_local(doc, review, true) end,
+            })
+          end
+        or conflicts.resolve
+    elseif present(state.held) and state.held.reason == 'history-conflict' then
+      action = conflicts.history
+    elseif present(state.disk) and present(state.disk.held) then
+      action = conflicts.recovery
+    end
+  end
+  if not action then
+    config.log(
+      'warn',
+      'No text conflict is ready for resolution%s',
+      held_reason(doc) and (': ' .. held_reason(doc)) or ''
+    )
+    return
+  end
+  local ok, view = pcall(action, doc.controller)
+  if not ok then
+    config.log('error', '%s', vim.inspect(view))
+    return
+  end
+  if kind == 'codediff' and view and view.open_codediff then
+    local opened, err = pcall(view.open_codediff, view)
+    if not opened then config.log('warn', '%s; native review remains available', vim.inspect(err)) end
+  end
+  return view
+end
+
+function M.recover(kind)
+  if kind ~= 'locks' then return M.resolve('recovery') end
+  local failed = sync._failed_workspace
+  if not failed then
+    config.log('info', 'No failed project ownership to review')
+    return
+  end
+  return require('overleaf.conflicts').locks(failed.params, {
+    on_recovered = function() M._connect_project(config.get().cookie, failed.options.projectId, failed.options.name) end,
+  })
+end
+
+function M.conflicts()
+  local context = sync._workspace
+  if not context then
+    config.log('info', 'No active workspace')
+    return
+  end
+  local items = {}
+  for _, doc in pairs(context.documents) do
+    local reason = held_reason(doc)
+    if reason then items[#items + 1] = { label = doc.path .. ': ' .. reason, doc = doc } end
+  end
+  for _, asset in pairs(context.assets) do
+    if present(asset.state.lifecycle) or (asset.state.status ~= 'synced' and asset.state.status ~= 'local-only') then
+      items[#items + 1] = { label = asset.state.path .. ': ' .. asset.state.status, asset = asset }
+    end
+  end
+  table.sort(items, function(a, b) return a.label < b.label end)
+  if #items == 0 then
+    config.log('info', 'No held documents or binary changes')
+    return
+  end
+  vim.ui.select(
+    items,
+    { prompt = 'Overleaf conflicts:', format_item = function(item) return item.label end },
+    function(item)
+      if not item or sync._workspace ~= context then return end
+      if item.asset then
+        bridge.request(
+          'syncAsset',
+          { session = context.session, document = item.asset.document, path = item.asset.state.path },
+          function(err, review)
+            if err then
+              config.log('error', '%s', err.message)
+              return
+            end
+            if sync._workspace ~= context then return end
+            require('overleaf.conflicts').asset(review, {
+              on_resolved = function(result)
+                if sync._workspace == context then
+                  context.assets[result.document] = result
+                  context.asset_sources[result.document] = result.state.path
+                end
+              end,
+            })
+          end
+        )
+      else
+        sync.open_document({ id = item.doc.doc_id, path = item.doc.path }, {}, function(err)
+          if err then
+            config.log('error', '%s', err.message)
+            return
+          end
+          M.resolve()
+        end)
+      end
+    end
+  )
+end
+
 function M.disconnect()
+  M._connection_generation = (M._connection_generation or 0) + 1
   -- Stop auto-reconnect
   M._reconnect.attempt = 0
   M._reconnect.in_progress = false
@@ -1719,8 +2062,21 @@ function M.disconnect()
     M._reconnect.timer = nil
   end
   bridge._on_unexpected_exit = nil
+  M._state.manual_disconnect = true
 
   pcall(function() require('overleaf.local_compile').stop_watch({ silent = true }) end)
+
+  if sync._workspace then
+    M._state.connected = false
+    sync.network_disconnected()
+    pcall(function() require('overleaf.cursors').clear_all() end)
+    pcall(function() require('overleaf.comments').clear_all() end)
+    bridge.request('disconnect', {}, function(err)
+      if err then config.log('error', '%s', err.message) end
+    end)
+    config.log('info', 'Offline; local editing and saving remain available')
+    return
+  end
 
   -- Stop file sync watchers
   sync.stop()
@@ -1729,10 +2085,7 @@ function M.disconnect()
   pcall(function() require('overleaf.cursors').clear_all() end)
   pcall(function() require('overleaf.comments').clear_all() end)
 
-  -- Leave all documents
-  for _, doc in pairs(M._state.documents) do
-    doc:leave(function() buffer.cleanup(doc) end)
-  end
+  -- Legacy buffers remain available for explicit migration.
   M._state.documents = {}
 
   -- Disconnect bridge
@@ -1750,6 +2103,21 @@ function M.disconnect()
 end
 
 function M.status()
+  if sync._workspace then
+    config.log(
+      'info',
+      'Project: %s | %s',
+      M._state.project_name or '?',
+      M._state.connected and 'connected' or 'offline'
+    )
+    for _, doc in pairs(sync._workspace.documents) do
+      config.log('info', '  %s: %s', doc.path, document_status(doc))
+    end
+    for _, asset in pairs(sync._workspace.assets) do
+      config.log('info', '  %s: %s', asset.state.path, asset.state.status)
+    end
+    return
+  end
   if not M._state.connected then
     config.log('info', 'Not connected')
     return
@@ -1776,6 +2144,12 @@ end
 --- Statusline component for lualine or custom statusline
 --- Usage with lualine: sections = { lualine_x = { require('overleaf').statusline } }
 function M.statusline()
+  if sync._workspace then
+    local _, _, doc = current_document()
+    local prefix = 'OL: ' .. (M._state.project_name or sync._workspace.name or '?')
+    return prefix
+      .. (doc and (' / ' .. doc.path .. ' | ' .. document_status(doc)) or (M._state.connected and '' or ' | offline'))
+  end
   if not M._state.connected then return '' end
 
   local proj = M._state.project_name or '?'

@@ -1,6 +1,6 @@
 local bridge = require('overleaf.bridge')
 local config = require('overleaf.config')
-local ot = require('overleaf.ot')
+local coordinates = require('overleaf.coordinates')
 local project = require('overleaf.project')
 
 local M = {}
@@ -11,6 +11,8 @@ local COMMENT_SEVERITY = vim.diagnostic.severity.HINT
 M._threads = {} -- threadId -> { id, messages, resolved, resolved_by }
 M._doc_comments = {} -- docId -> { { threadId, offset, length, content } }
 M._doc_contents = {} -- docId -> content snapshot used for unopened comment locations
+M._requests = {}
+M._deleted_threads = {}
 M._ns = vim.api.nvim_create_namespace('overleaf_comments')
 M._diag_ns = vim.api.nvim_create_namespace('overleaf_comments_diagnostics')
 M._diag_sign_ns = vim.api.nvim_create_namespace('nvim.overleaf_comments_diagnostics.diagnostic.signs')
@@ -28,9 +30,7 @@ local function first_attr(attr, groups)
   end
 end
 
-local function blend_channel(fg, bg, alpha)
-  return math.floor(bg + (fg - bg) * alpha + 0.5)
-end
+local function blend_channel(fg, bg, alpha) return math.floor(bg + (fg - bg) * alpha + 0.5) end
 
 local function blend(fg, bg, alpha)
   if not fg or not bg then return nil end
@@ -84,10 +84,18 @@ vim.diagnostic.config({
 
 --- Load all threads from the Overleaf API
 function M.load_threads(project_id, callback)
+  local context, token = require('overleaf.sync')._workspace, {}
+  M._thread_request = token
   bridge.request('getThreads', {
     cookie = config.get().cookie,
     projectId = project_id,
   }, function(err, result)
+    if require('overleaf.sync')._workspace ~= context or M._thread_request ~= token then
+      if callback then
+        callback({ code = 'SESSION_CLOSED', message = 'Project changed while loading comment threads' })
+      end
+      return
+    end
     if err then
       config.log('error', 'Failed to load threads: %s', err.message)
       if callback then callback(err) end
@@ -136,7 +144,7 @@ function M.parse_ranges(doc_id, ranges)
       table.insert(M._doc_comments[doc_id], {
         threadId = op.t,
         offset = op.p or 0, -- character offset in document
-        length = op.c and ot.utf8_len(op.c) or 0,
+        length = op.c and coordinates.utf8_len(op.c) or 0,
         content = op.c or '',
       })
       config.log(
@@ -144,7 +152,7 @@ function M.parse_ranges(doc_id, ranges)
         'Comment: thread=%s offset=%d len=%d text="%s"',
         op.t,
         op.p or 0,
-        op.c and ot.utf8_len(op.c) or 0,
+        op.c and coordinates.utf8_len(op.c) or 0,
         (op.c or ''):sub(1, 30)
       )
     end
@@ -156,7 +164,7 @@ local function offset_to_pos(content, offset)
   content = content or ''
   offset = math.max(tonumber(offset) or 0, 0)
 
-  local byte_offset = ot.char_to_byte(content, offset)
+  local byte_offset = coordinates.char_to_byte(content, offset)
   local before = content:sub(1, byte_offset)
   local line = 1
   local line_start = 0
@@ -195,9 +203,7 @@ local function thread_summary(thread)
   return text ~= '' and text or '[comment]'
 end
 
-local function message_user(msg)
-  return msg.user and (msg.user.first_name or msg.user.email) or '?'
-end
+local function message_user(msg) return msg.user and (msg.user.first_name or msg.user.email) or '?' end
 
 local function message_timestamp(msg)
   if not msg.timestamp then return '' end
@@ -223,7 +229,7 @@ local function upsert_doc_comment(doc_id, thread_id, offset, text)
   for _, comment in ipairs(M._doc_comments[doc_id]) do
     if comment.threadId == thread_id then
       comment.offset = offset
-      comment.length = ot.utf8_len(text or '')
+      comment.length = coordinates.utf8_len(text or '')
       comment.content = text or ''
       return comment
     end
@@ -232,7 +238,7 @@ local function upsert_doc_comment(doc_id, thread_id, offset, text)
   local comment = {
     threadId = thread_id,
     offset = offset,
-    length = ot.utf8_len(text or ''),
+    length = coordinates.utf8_len(text or ''),
     content = text or '',
   }
   table.insert(M._doc_comments[doc_id], comment)
@@ -268,7 +274,11 @@ local function comment_locations()
       local thread = M._threads[c.threadId]
       if thread and not thread.resolved then
         local lnum, col0 = 1, 0
-        if content then lnum, col0 = offset_to_pos(content, c.offset) end
+        if c.start then
+          lnum, col0 = c.start.row + 1, c.start.col
+        elseif content then
+          lnum, col0 = offset_to_pos(content, c.offset)
+        end
 
         locations[#locations + 1] = {
           doc_id = doc_id,
@@ -307,71 +317,47 @@ end
 ---@param project_id string
 ---@param callback? fun(err: table|nil, stats: table|nil)
 function M.refresh_project_comments(project_id, callback)
-  local docs = project_docs()
-  if #docs == 0 then
-    if callback then callback(nil, { total = 0, failed = 0 }) end
+  local context = require('overleaf.sync')._workspace
+  if context then
+    local docs, failed, index = project_docs(), 0, 0
+    M.load_threads(project_id, function(err)
+      if err then
+        if callback then callback(err) end
+        return
+      end
+      local function next_doc()
+        if require('overleaf.sync')._workspace ~= context or context.closing then
+          if callback then callback({ code = 'SESSION_CLOSED', message = 'Project changed during comment refresh' }) end
+          return
+        end
+        index = index + 1
+        local entry = docs[index]
+        if not entry then
+          if callback then callback(nil, { total = #docs, failed = failed }) end
+          return
+        end
+        local doc = context.documents[entry.id]
+        if not doc then
+          failed = failed + 1
+          vim.schedule(next_doc)
+          return
+        end
+        M.refresh_document(doc, function(failure)
+          if failure then failed = failed + 1 end
+          vim.schedule(next_doc)
+        end)
+      end
+      next_doc()
+    end)
     return
   end
-
-  config.log('info', 'Refreshing comments from %d documents...', #docs)
-
-  M.load_threads(project_id, function(err)
-    if err then
-      if callback then callback(err, nil) end
-      return
-    end
-
-    local ok, overleaf = pcall(require, 'overleaf')
-    local state = ok and overleaf._state or { documents = {} }
-    local failed = 0
-
-    local function process_next(idx)
-      if idx > #docs then
-        if callback then callback(nil, { total = #docs, failed = failed }) end
-        return
-      end
-
-      local doc_entry = docs[idx]
-      local open_doc = state.documents and state.documents[doc_entry.id] or nil
-      local active_doc = open_doc
-        and (
-          open_doc.joined == true
-          or open_doc._rejoining == true
-          or (open_doc.bufnr and vim.api.nvim_buf_is_valid(open_doc.bufnr))
-        )
-
-      if active_doc then
-        if open_doc.content then M._doc_contents[doc_entry.id] = open_doc.content end
-        if open_doc.ranges then M.parse_ranges(doc_entry.id, open_doc.ranges) end
-        if open_doc.bufnr and vim.api.nvim_buf_is_valid(open_doc.bufnr) then
-          vim.schedule(function() M.render(open_doc.bufnr, doc_entry.id, open_doc.content or '') end)
-        end
-        process_next(idx + 1)
-        return
-      end
-
-      bridge.request('joinDoc', { docId = doc_entry.id }, function(join_err, result)
-        if join_err or not result then
-          failed = failed + 1
-          config.log('warn', 'Failed to refresh comments for %s: %s', doc_entry.path, join_err and join_err.message or 'empty result')
-          process_next(idx + 1)
-          return
-        else
-          local content = table.concat(result.lines or {}, '\n')
-          M._doc_contents[doc_entry.id] = content
-          M.parse_ranges(doc_entry.id, result.ranges)
-        end
-
-        bridge.request('leaveDoc', { docId = doc_entry.id }, function() process_next(idx + 1) end)
-      end)
-    end
-
-    process_next(1)
-  end)
+  if callback then
+    callback({ code = 'NO_WORKSPACE', message = 'Open a project workspace before refreshing comments' })
+  end
 end
 
 --- Render comment markers on a buffer using extmarks
-function M.render(bufnr, doc_id, content)
+local function render_known(bufnr, doc_id, content)
   if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then return end
 
   vim.api.nvim_buf_clear_namespace(bufnr, M._ns, 0, -1)
@@ -393,8 +379,13 @@ function M.render(bufnr, doc_id, content)
     local thread = M._threads[c.threadId]
     local resolved = thread and thread.resolved or false
     if not resolved then
-      local start_line, start_col = offset_to_pos(content, c.offset)
-      local end_line, end_col = offset_to_pos(content, c.offset + c.length)
+      local start_line, start_col, end_line, end_col
+      if c.start then
+        start_line, start_col, end_line, end_col = c.start.row + 1, c.start.col, c.finish.row + 1, c.finish.col
+      else
+        start_line, start_col = offset_to_pos(content, c.offset)
+        end_line, end_col = offset_to_pos(content, c.offset + c.length)
+      end
 
       if start_line > line_count then start_line = line_count end
       if end_line > line_count then end_line = line_count end
@@ -402,7 +393,7 @@ function M.render(bufnr, doc_id, content)
       -- Highlight the range (each comment gets its own highlight)
       pcall(
         function()
-          vim.api.nvim_buf_set_extmark(bufnr, M._ns, start_line - 1, start_col, {
+          c.mark = vim.api.nvim_buf_set_extmark(bufnr, M._ns, start_line - 1, start_col, {
             end_row = end_line - 1,
             end_col = end_col,
             hl_group = 'OverleafComment',
@@ -427,19 +418,79 @@ function M.render(bufnr, doc_id, content)
       local sign_lnum = math.max(start_line - 1, 0)
       if not signed_lines[sign_lnum] then
         signed_lines[sign_lnum] = true
-        pcall(function()
-          vim.api.nvim_buf_set_extmark(bufnr, M._diag_sign_ns, sign_lnum, 0, {
-            sign_text = COMMENT_ICON,
-            sign_hl_group = 'OverleafCommentSign',
-            cursorline_hl_group = 'OverleafCommentSign',
-            priority = 15,
-          })
-        end)
+        pcall(
+          function()
+            vim.api.nvim_buf_set_extmark(bufnr, M._diag_sign_ns, sign_lnum, 0, {
+              sign_text = COMMENT_ICON,
+              sign_hl_group = 'OverleafCommentSign',
+              cursorline_hl_group = 'OverleafCommentSign',
+              priority = 15,
+            })
+          end
+        )
       end
     end
   end
 
   vim.diagnostic.set(M._diag_ns, bufnr, diagnostics)
+end
+
+function M.refresh_document(doc, callback)
+  callback = callback or function() end
+  local pending = M._requests[doc.doc_id]
+  if pending then
+    pending.again = true
+    pending.callbacks[#pending.callbacks + 1] = callback
+    return
+  end
+  local token = { callbacks = { callback } }
+  local function done(err, result)
+    for _, receive in ipairs(token.callbacks) do
+      receive(err, result)
+    end
+  end
+  M._requests[doc.doc_id] = token
+  require('overleaf.sync').project_features(doc, {}, function(err, result, view)
+    if M._requests[doc.doc_id] ~= token then
+      done({ code = 'SESSION_CLOSED', message = 'Comment projection was cancelled' })
+      return
+    end
+    M._requests[doc.doc_id] = nil
+    if (not err and token.again) or (err and err.code == 'STALE_VIEW') then
+      M.refresh_document(doc, done)
+      return
+    end
+    if err then
+      done(err)
+      return
+    end
+    local comments = {}
+    for _, range in ipairs(result.comments) do
+      if not M._deleted_threads[range.id] then
+        comments[#comments + 1] = {
+          threadId = range.id,
+          content = range.content,
+          start = range.start,
+          finish = range['end'],
+          tick = view.tick,
+          buf = view.buf,
+        }
+      end
+    end
+    M._doc_comments[doc.doc_id], M._doc_contents[doc.doc_id] = comments, view.content
+    if view.buf and vim.api.nvim_buf_is_loaded(view.buf) then render_known(view.buf, doc.doc_id, view.content) end
+    done(nil, result)
+  end)
+end
+
+function M.render(bufnr, doc_id, content)
+  local context = require('overleaf.sync')._workspace
+  local doc = context and context.documents[doc_id]
+  if doc and doc.engine and doc.bufnr == bufnr then
+    M.refresh_document(doc)
+    return
+  end
+  render_known(bufnr, doc_id, content)
 end
 
 --- Get comment thread at cursor position
@@ -455,12 +506,29 @@ function M.get_thread_at_cursor(doc_id, _content)
   local lines = vim.api.nvim_buf_get_lines(0, 0, cursor_line, false)
   local offset = 0
   for i = 1, #lines - 1 do
-    offset = offset + ot.utf8_len(lines[i]) + 1 -- +1 for newline
+    offset = offset + coordinates.utf8_len(lines[i]) + 1 -- +1 for newline
   end
-  offset = offset + ot.utf8_len((lines[#lines] or ''):sub(1, cursor_col))
+  offset = offset + coordinates.utf8_len((lines[#lines] or ''):sub(1, cursor_col))
 
   for _, c in ipairs(comments) do
-    if offset >= c.offset and offset <= c.offset + c.length then
+    local contains
+    if c.start then
+      local first, last = c.start, c.finish
+      local valid = c.buf == vim.api.nvim_get_current_buf() and c.tick == vim.api.nvim_buf_get_changedtick(c.buf)
+      if c.mark and c.buf == vim.api.nvim_get_current_buf() then
+        local mark = vim.api.nvim_buf_get_extmark_by_id(c.buf, M._ns, c.mark, { details = true })
+        if #mark > 0 then
+          first, last, valid = { row = mark[1], col = mark[2] }, { row = mark[3].end_row, col = mark[3].end_col }, true
+        end
+      end
+      local row = cursor_line - 1
+      contains = valid
+        and (row > first.row or (row == first.row and cursor_col >= first.col))
+        and (row < last.row or (row == last.row and cursor_col <= last.col))
+    else
+      contains = offset >= c.offset and offset <= c.offset + c.length
+    end
+    if contains then
       local thread = M._threads[c.threadId]
       if thread then return thread, c end
     end
@@ -525,8 +593,8 @@ function M.show_thread(thread)
 end
 
 --- Show all comments in the configured picker
-function M.list_all(_project_id)
-  M.refresh_project_comments(_project_id, function(err, stats)
+function M.list_all(project_id)
+  M.refresh_project_comments(project_id, function(err, stats)
     if err then return end
 
     local locations = comment_locations()
@@ -539,9 +607,7 @@ function M.list_all(_project_id)
       require('overleaf.picker').locations({
         title = 'Overleaf Comments',
         fallback = 'select',
-      }, locations, function(location)
-        require('overleaf').open_location(location)
-      end)
+      }, locations, function(location) require('overleaf').open_location(location) end)
 
       if stats and stats.failed and stats.failed > 0 then
         config.log('warn', 'Listed comments with %d document refresh failure(s)', stats.failed)
@@ -561,12 +627,13 @@ end
 function M.add_local_thread(doc_id, thread_id, offset, selected_text, content, user, message)
   if not doc_id or not thread_id then return end
 
-  local thread = M._threads[thread_id] or {
-    id = thread_id,
-    messages = {},
-    resolved = false,
-    resolved_by = nil,
-  }
+  local thread = M._threads[thread_id]
+    or {
+      id = thread_id,
+      messages = {},
+      resolved = false,
+      resolved_by = nil,
+    }
   M._threads[thread_id] = thread
 
   local msg = type(message) == 'table' and message or {}
@@ -627,6 +694,7 @@ end
 function M.on_delete_thread(data)
   if not data or not data.threadId then return end
   M._threads[data.threadId] = nil
+  M._deleted_threads[data.threadId] = true
   -- Remove from doc_comments
   for _, comments in pairs(M._doc_comments) do
     for i = #comments, 1, -1 do
@@ -635,10 +703,116 @@ function M.on_delete_thread(data)
   end
 end
 
+--- Inspect retained drafts without repeating an uncertain HTTP request.
+function M.review_drafts(doc, context, selection)
+  local function current() return require('overleaf.sync')._workspace == context and not context.closing end
+  bridge.request(
+    'syncDocument',
+    { session = context.session, document = doc.doc_id, action = 'state' },
+    function(err, reply)
+      if not current() then return end
+      if err then
+        config.log('error', '%s', err.message)
+        return
+      end
+      local drafts = reply.state.comments or {}
+      if #drafts == 0 then
+        config.log('info', 'No retained comment drafts')
+        return
+      end
+      vim.ui.select(drafts, {
+        prompt = 'Retained comment drafts',
+        format_item = function(draft) return draft.thread .. ': ' .. draft.message:gsub('\n', ' '):sub(1, 80) end,
+      }, function(draft)
+        if not draft or not current() then return end
+        local buf = vim.api.nvim_create_buf(false, true)
+        vim.bo[buf].bufhidden, vim.bo[buf].swapfile, vim.bo[buf].modeline = 'hide', false, false
+        local function show(status)
+          if not vim.api.nvim_buf_is_valid(buf) then return end
+          vim.bo[buf].modifiable = true
+          vim.api.nvim_buf_set_lines(
+            buf,
+            0,
+            -1,
+            false,
+            vim.split(
+              table.concat({
+                'Comment draft: ' .. draft.thread,
+                status,
+                '',
+                draft.message,
+                '',
+                'Selected text:',
+                draft.op.c,
+                '',
+                'c: check whether the server received the message',
+                'a: attach to the source selection captured before opening this view',
+                'q: close (draft remains retained)',
+                '',
+                'Checking never posts the message again. If unconfirmed, inspect the thread in Overleaf.',
+                'The message and selected text can be copied from this buffer.',
+              }, '\n'),
+              '\n',
+              { plain = true }
+            )
+          )
+          vim.bo[buf].modified, vim.bo[buf].modifiable = false, false
+        end
+        show(
+          draft.held ~= vim.NIL and draft.held
+            or (draft.posted and 'Message posted; anchor awaiting confirmation' or 'Message outcome unconfirmed')
+        )
+        vim.cmd('botright new')
+        vim.api.nvim_win_set_buf(0, buf)
+        local function received(failure, result)
+          if not current() then return end
+          if failure then
+            show(failure.message)
+            return
+          end
+          show(
+            result.status or (result.result and result.result.held) or 'Anchor queued; awaiting applied confirmation'
+          )
+          if doc.controller then doc.controller:refresh() end
+        end
+        vim.keymap.set('n', 'c', function()
+          if not current() then return end
+          bridge.request('syncComment', {
+            session = context.session,
+            document = doc.doc_id,
+            action = 'inspect',
+            token = draft.token,
+            cookie = config.get().cookie,
+            csrfToken = require('overleaf')._state.csrf_token,
+          }, received)
+        end, { buffer = buf })
+        vim.keymap.set('n', 'a', function()
+          if not current() then return end
+          if not selection or not selection.current() then
+            show('Select source text again, then reopen the drafts view')
+            return
+          end
+          bridge.request('syncDocument', {
+            session = context.session,
+            document = doc.doc_id,
+            action = 'reanchorComment',
+            token = draft.token,
+            selection = { view = selection.view, start = selection.start, ['end'] = selection['end'] },
+          }, received)
+        end, { buffer = buf })
+        vim.keymap.set('n', 'q', function() vim.api.nvim_buf_delete(buf, { force = true }) end, { buffer = buf })
+      end)
+    end
+  )
+end
+
 function M.clear_all()
   M._threads = {}
   M._doc_comments = {}
   M._doc_contents = {}
+  M._requests = {}
+  M._thread_request = nil
+  M._deleted_threads = {}
 
   for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
     if vim.api.nvim_buf_is_valid(bufnr) then

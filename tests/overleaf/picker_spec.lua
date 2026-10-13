@@ -45,9 +45,7 @@ describe('picker', function()
     picker.select(items, {
       prompt = 'Pick:',
       format_item = function(item) return item.label end,
-    }, function(choice)
-      selected = choice
-    end)
+    }, function(choice) selected = choice end)
 
     assert.are.same(items[2], selected)
   end)
@@ -134,9 +132,7 @@ describe('picker', function()
 
   it('opens Overleaf locations from repeated qf buffer jumps', function()
     local opened = {}
-    require('overleaf').open_location = function(location)
-      opened[#opened + 1] = vim.deepcopy(location)
-    end
+    require('overleaf').open_location = function(location) opened[#opened + 1] = vim.deepcopy(location) end
 
     local locations = {
       {

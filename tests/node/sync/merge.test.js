@@ -2,7 +2,13 @@
 
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
-const { mergeText } = require('../../../node/sync/merge');
+const fs = require('node:fs/promises');
+const os = require('node:os');
+const path = require('node:path');
+const { execFile } = require('node:child_process');
+const { promisify } = require('node:util');
+const run = promisify(execFile);
+const { mergeText, createConflictWorkspace } = require('../../../node/sync/merge');
 
 test('combines independent edits using their actual common ancestor', async () => {
   const result = await mergeText({
@@ -123,4 +129,40 @@ test('independent documents do not share temporary merge files', async () => {
   results.forEach((result, i) => {
     assert.deepEqual(result, { status: 'clean', content: `local${i}\nseparator\nremote${i}\n` });
   });
+});
+
+test('CodeDiff workspaces isolate all index stages, preserve the marked candidate, and create no commits', async t => {
+  const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'overleaf-review-'));
+  t.after(() => fs.rm(parent, { recursive: true, force: true }));
+  const user = path.join(parent, 'user'); await fs.mkdir(user);
+  await run('git', ['init', '--quiet', user]);
+  await fs.writeFile(path.join(user, 'keep'), 'user work');
+  await run('git', ['-C', user, 'add', 'keep']);
+  const index = await fs.readFile(path.join(user, '.git', 'index'));
+  const inputs = { base: 'base\n', local: 'local\n', remote: 'remote\n' };
+  const candidate = (await mergeText(inputs)).candidate;
+  const saved = { GIT_DIR: process.env.GIT_DIR, GIT_WORK_TREE: process.env.GIT_WORK_TREE };
+  process.env.GIT_DIR = path.join(user, '.git'); process.env.GIT_WORK_TREE = user;
+  let review;
+  try { review = await createConflictWorkspace(inputs, candidate, { root: parent }); }
+  finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  }
+  assert.deepEqual(await fs.readFile(path.join(user, '.git', 'index')), index);
+  for (const [stage, content] of [[1, inputs.base], [2, inputs.local], [3, inputs.remote]]) {
+    assert.equal((await run('git', ['-C', review.directory, 'show', `:${stage}:result`])).stdout, content);
+  }
+  assert.equal(await fs.readFile(review.path, 'utf8'), candidate);
+  assert.equal(await fs.readFile(review.candidate, 'utf8'), candidate);
+  assert.equal((await run('git', ['-C', review.directory, 'remote'])).stdout, '');
+  await assert.rejects(run('git', ['-C', review.directory, 'rev-parse', '--verify', 'HEAD']));
+  assert.equal((await fs.stat(review.directory)).mode & 0o077, 0);
+});
+
+test('CodeDiff preparation refuses unknown ancestry and unbounded or malformed inputs', async () => {
+  await assert.rejects(createConflictWorkspace({ base: null, local: 'local', remote: 'remote' }, ''), { code: 'NO_MERGE_BASE' });
+  await assert.rejects(createConflictWorkspace({ base: 'base', local: 'bad\0text', remote: 'remote' }, ''), /Unicode|text/);
+  await assert.rejects(createConflictWorkspace({ base: '', local: 'a'.repeat(16 * 1024 * 1024 + 1), remote: '' }, ''), { code: 'MERGE_LIMIT' });
 });

@@ -11,15 +11,15 @@ M._config = {
     backend = 'overleaf', -- 'overleaf' or 'local'
     main_file = nil, -- Main tex file for local compilation (nil = infer from Overleaf project)
     local_command = nil, -- Command/table for one-shot local compile; {main} is replaced with main_file
-    local_watch_command = nil, -- Command/table for live local compile watch; {main} is replaced with main_file
+    local_watch_command = nil, -- Rejected: configure one-shot local_command for snapshot watch builds
     open_pdf = true, -- Open PDF after successful local compile / watch start
-    auto_start_watch = false, -- Start local latexmk -pvc after connecting when backend='local'
-    watch_log = false, -- Log latexmk -pvc output at debug level
+    auto_start_watch = false, -- Watch saved inputs after connecting when backend='local'
+    watch_log = false, -- Log watched compile output at debug level
   },
-  sync_dir = nil, -- Local file sync directory (nil = disabled; enables external tool integration)
+  sync_dir = nil, -- Parent of ID-based workspaces (nil = stdpath('data')/overleaf/workspaces)
   explorer = 'native', -- 'native' or 'canola'
   picker = 'auto', -- 'auto', 'snacks', or 'native'
-  cleanup_buffers_on_exit = true, -- Wipe overleaf:// buffers before exit so sessions don't restore dead buffers
+  cleanup_buffers_on_exit = true, -- Remove clean UI launchers; retain ordinary and legacy source buffers
   log_level = 'info', -- 'debug', 'info', 'warn', 'error'
 }
 
@@ -34,9 +34,7 @@ local function merge(dst, src)
 end
 
 function M.setup(opts)
-  if opts then
-    merge(M._config, opts)
-  end
+  if opts then merge(M._config, opts) end
 end
 
 function M.get() return M._config end

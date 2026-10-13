@@ -7,15 +7,11 @@ local canola_registered = false
 
 local function state() return require('overleaf')._state end
 
-local function open_native()
-  require('overleaf.tree').toggle()
-end
+local function open_native() require('overleaf.tree').toggle() end
 
 local function ensure_canola()
   local ok, canola = pcall(require, 'canola')
-  if not ok then
-    return nil, 'canola.nvim is not available'
-  end
+  if not ok then return nil, 'canola.nvim is not available' end
   if not canola_registered then
     canola.register_adapter('canola-overleaf://', 'overleaf')
     canola_registered = true
@@ -41,7 +37,7 @@ local function open_canola()
 end
 
 function M.open()
-  if not state().connected then
+  if not state().connected and not require('overleaf.sync')._workspace then
     config.log('warn', 'Not connected. Run :Overleaf projects first.')
     return
   end

@@ -41,6 +41,31 @@ async function fixture(t) {
   return { engine, store };
 }
 
+test('migration retains an independent branch without saving, publishing, or replacing native edits', async t => {
+  const { engine, store } = await fixture(t);
+  await engine.bindDisk('main.tex', base);
+  await engine.checkpointEditor(editorCheckpoint([base]), engine.snapshot().revision);
+  const native = editorCheckpoint([base, 'UNSAVED ' + base]);
+  await engine.checkpointEditor(native, engine.snapshot().revision);
+  const before = engine.snapshot();
+  await engine.importBranch({ content: 'legacy independent text', origin: { kind: 'file', name: '/old/Paper/main.tex' } },
+    native, before.revision);
+  const after = engine.snapshot();
+  assert.equal(after.conflict.kind, 'migration');
+  assert.equal(after.conflict.inputs.base, null);
+  assert.equal(after.saved, before.saved);
+  assert.equal(after.buffer, before.buffer);
+  assert.deepEqual(after.editor.checkpoint, native);
+  assert.equal(after.recovery.migration.content, 'legacy independent text');
+  assert.equal(await engine.prepareUpload(), null);
+  const review = await engine.prepareConflictResolution(after.conflict.id, {}, engine.snapshot().revision);
+  assert.equal(review.inputs.local, 'legacy independent text');
+  assert.equal(review.inputs.remote, base);
+  const reopened = await DocumentEngine.open(store, 'doc');
+  assert.equal(reopened.snapshot().recovery.migration.content, 'legacy independent text');
+  assert.equal(reopened.snapshot().saved, base);
+});
+
 test('never publishes a buffer checkpoint before it is saved', async (t) => {
   const { engine } = await fixture(t);
   await engine.edit('unsaved text', engine.snapshot().revision);
@@ -627,4 +652,290 @@ test('already reverted local text consumes its undo entry without removing it tw
   assert.equal(await engine.undo(engine.snapshot().revision), false);
   assert.equal(await engine.redo(engine.snapshot().revision), true);
   assert.equal(engine.snapshot().buffer, base, 'redo reverses only what undo actually changed');
+});
+
+
+test('explicit disk recovery preserves unsaved checkpoints and reconciles the inspected saved branch', async t => {
+  const { engine } = await fixture(t);
+  await engine.bindDisk('main.tex', base);
+  const edited = 'MY ' + base;
+  await engine.checkpointEditor(editorCheckpoint([base]), engine.snapshot().revision);
+  await engine.checkpointEditor(editorCheckpoint([base, edited]), engine.snapshot().revision);
+  const pending = await engine.beginEditorSave(editorCheckpoint([base, edited]), engine.snapshot().revision, base);
+  await engine.holdDisk('write-recovery');
+  const before = engine.snapshot();
+  await engine.recoverDisk(edited, before.revision);
+  const state = engine.snapshot();
+  assert.equal(state.disk.pending, null);
+  assert.equal(state.disk.held, null);
+  assert.equal(state.disk.content, edited);
+  assert.equal(state.saved, edited);
+  assert.equal(state.buffer, edited);
+  assert.deepEqual(state.editor.checkpoint, before.editor.checkpoint);
+  assert.equal(state.editor.held.reason, 'recovery');
+  assert.deepEqual(state.recovery.disk.pending, pending);
+  await assert.rejects(engine.recoverDisk(base, before.revision), { code: 'STALE_REVISION' });
+});
+
+test('recovering disk does not clear an uncertain upload', async t => {
+  const { engine } = await fixture(t);
+  await engine.bindDisk('main.tex', base);
+  await engine.edit('SAVED ' + base, engine.snapshot().revision);
+  await engine.save('SAVED ' + base, engine.snapshot().revision);
+  const disk = await engine.planDiskWrite();
+  await engine.finishDiskWrite(disk.token, true);
+  const upload = await engine.prepareUpload();
+  await engine.markUncertain(upload.token);
+  await engine.holdDisk('write-recovery');
+  const before = engine.snapshot();
+  await engine.recoverDisk(before.disk.content, before.revision);
+  const after = engine.snapshot();
+  assert.deepEqual(after.pending, before.pending);
+  assert.deepEqual(after.conflict, before.conflict);
+  assert.equal(after.saved, before.saved);
+});
+
+
+test('reattachment preserves both native histories before restoring an archived editor', async t => {
+  const { engine } = await fixture(t);
+  await engine.checkpointEditor(editorCheckpoint([base]), engine.snapshot().revision);
+  const archived = editorCheckpoint([base, 'UNSAVED ' + base]);
+  await engine.checkpointEditor(archived, engine.snapshot().revision);
+  const current = editorCheckpoint(['independent disk', 'independent buffer']);
+  const proposal = await engine.prepareReattach(current, engine.snapshot().revision);
+  assert.deepEqual(proposal.checkpoint, archived);
+  assert.deepEqual(engine.snapshot().editor.recovery.before, current);
+  assert.deepEqual(engine.snapshot().editor.checkpoint, archived);
+  await engine.receiveRemote({ content: base.replace('conclusion', 'REMOTE conclusion'), version: 2 });
+  await engine.acceptReattach(proposal.token, archived);
+  assert.deepEqual(engine.snapshot().editor.checkpoint, archived);
+  assert.equal(engine.snapshot().buffer, ('UNSAVED ' + base).replace('conclusion', 'REMOTE conclusion'));
+  assert.equal(engine.snapshot().saved, base.replace('conclusion', 'REMOTE conclusion'));
+  assert.equal(engine.snapshot().editor.held, null);
+  assert.deepEqual(engine.snapshot().recovery.editor.before, current);
+});
+
+test('choosing the current file retains the displaced archive and never publishes its unsaved text', async t => {
+  const { engine } = await fixture(t);
+  await engine.bindDisk('main.tex', base);
+  await engine.edit('archived unsaved', engine.snapshot().revision);
+  const archived = editorCheckpoint([base, 'archived unsaved']);
+  await engine.checkpointEditor(archived, engine.snapshot().revision);
+  const current = editorCheckpoint([base]);
+  await engine.useEditor(current, engine.snapshot().revision, base);
+  const state = engine.snapshot();
+  assert.deepEqual(state.editor.checkpoint, current);
+  assert.deepEqual(state.recovery.editorChoice.editor.checkpoint, archived);
+  assert.equal(state.recovery.editorChoice.buffer, 'archived unsaved');
+  assert.equal(state.buffer, base);
+  assert.equal(state.saved, base);
+  assert.equal(await engine.prepareUpload(), null);
+});
+
+test('an independently dirty existing buffer attaches as an unresolved branch without replacing disk or remote', async t => {
+  const { engine } = await fixture(t);
+  await engine.bindDisk('main.tex', base);
+  const dirty = editorCheckpoint(['previous disk', 'current unsaved']);
+  await engine.useEditor(dirty, engine.snapshot().revision, base);
+  const state = engine.snapshot();
+  assert.deepEqual(state.editor.checkpoint, dirty);
+  assert.equal(state.buffer, 'current unsaved');
+  assert.equal(state.saved, base);
+  assert.equal(state.disk.content, base);
+  assert.equal(state.conflict.reason, 'missing-base');
+  assert.equal(state.conflict.inputs.local, 'current unsaved');
+  assert.equal(await engine.prepareUpload(), null);
+});
+
+test('using the current editor keeps later remote text available for native rebase and rejects stale decisions', async t => {
+  const { engine } = await fixture(t);
+  await engine.bindDisk('main.tex', base);
+  const stale = engine.snapshot().revision;
+  const incoming = base.replace('conclusion', 'THEIR conclusion');
+  await engine.receiveRemote({ content: incoming, version: 2 });
+  await assert.rejects(engine.useEditor(editorCheckpoint([base]), stale, base), { code: 'STALE_REVISION' });
+  await engine.useEditor(editorCheckpoint([base]), engine.snapshot().revision, base);
+  assert.equal(engine.snapshot().buffer, incoming);
+  assert.equal(engine.snapshot().saved, incoming);
+  const update = await engine.prepareEditorUpdate(engine.snapshot().revision);
+  assert.equal(update.content, incoming);
+});
+
+test('reattachment rejects a changed target or stale token and retains both recovery histories', async t => {
+  const { engine } = await fixture(t);
+  const archived = editorCheckpoint([base]);
+  await engine.checkpointEditor(archived, engine.snapshot().revision);
+  const before = editorCheckpoint(['disk']);
+  const proposal = await engine.prepareReattach(before, engine.snapshot().revision);
+  await assert.rejects(engine.acceptReattach(proposal.token, editorCheckpoint(['wrong'])), { code: 'STALE_EDITOR' });
+  assert.deepEqual(engine.snapshot().editor.recovery.before, before);
+  await assert.rejects(engine.acceptReattach('wrong', archived), { code: 'STALE_EDITOR' });
+  await engine.acceptReattach(proposal.token, archived);
+  await assert.rejects(engine.acceptReattach(proposal.token, archived), { code: 'STALE_EDITOR' });
+});
+
+
+test('an explicitly retried restoration retains the earlier interrupted proposal across restart', async t => {
+  const { engine, store } = await fixture(t);
+  await engine.checkpointEditor(editorCheckpoint([base]), engine.snapshot().revision);
+  const first = await engine.prepareReattach(editorCheckpoint(['first reopening']), engine.snapshot().revision);
+  const reopened = await DocumentEngine.open(store, 'doc');
+  const second = await reopened.prepareReattach(editorCheckpoint(['second reopening']), reopened.snapshot().revision);
+  assert.deepEqual(reopened.snapshot().recovery.editor.before, editorCheckpoint(['first reopening']));
+  assert.deepEqual(reopened.snapshot().editor.recovery.before, editorCheckpoint(['second reopening']));
+  await assert.rejects(reopened.acceptReattach(first.token, first.checkpoint), { code: 'STALE_EDITOR' });
+  await reopened.acceptReattach(second.token, second.checkpoint);
+  assert.equal(reopened.snapshot().buffer, base);
+});
+
+
+test('a newer editor observation invalidates an unconfirmed restoration token', async t => {
+  const { engine } = await fixture(t);
+  await engine.checkpointEditor(editorCheckpoint([base]), engine.snapshot().revision);
+  const proposal = await engine.prepareReattach(editorCheckpoint(['disk']), engine.snapshot().revision);
+  const newer = editorCheckpoint([base, 'new local edits']);
+  await engine.checkpointEditor(newer, engine.snapshot().revision);
+  await assert.rejects(engine.acceptReattach(proposal.token, proposal.checkpoint), { code: 'STALE_EDITOR' });
+  assert.deepEqual(engine.snapshot().editor.checkpoint, newer);
+  assert.deepEqual(engine.snapshot().recovery.editor.before, editorCheckpoint(['disk']));
+});
+
+test('reviewed history conflict choices create a durable whole-tree proposal without publishing unsaved text', async t => {
+  const { engine, store } = await fixture(t);
+  const checkpoint = editorCheckpoint([base.replace('conclusion', 'OLD conclusion'), base]);
+  await engine.checkpointEditor(checkpoint, engine.snapshot().revision);
+  const target = base.replace('conclusion', 'THEIR conclusion');
+  await engine.receiveRemote({ content: target, version: 2 });
+  await engine.prepareEditorUpdate(engine.snapshot().revision);
+  const revision = engine.snapshot().revision;
+  const unresolved = await engine.prepareHistoryResolution({}, revision);
+  assert.equal(unresolved.status, 'conflict');
+  assert.equal(unresolved.seq, 0);
+  assert.equal(engine.snapshot().revision, revision);
+  const resolved = base.replace('conclusion', 'OLD with THEIR conclusion');
+  const proposal = await engine.prepareHistoryResolution({ 0: resolved }, revision);
+  assert.equal(proposal.status, 'ready');
+  assert.deepEqual(engine.snapshot().editor.checkpoint, checkpoint);
+  const durable = (await store.read('doc')).state.editor.pending;
+  assert.deepEqual(durable.resolutions, { 0: resolved });
+  await engine.acceptEditorUpdate(proposal.token, { ...checkpoint, history: proposal.history });
+  assert.equal(engine.snapshot().editor.held, null);
+  assert.equal(engine.snapshot().editor.checkpoint.history.nodes[0].content, resolved);
+  assert.equal(engine.snapshot().saved, target);
+  assert.equal(await engine.prepareUpload(), null);
+});
+
+test('history resolution refuses stale reviews and cannot bypass document conflicts or uncertainty', async t => {
+  const { engine } = await fixture(t);
+  const checkpoint = editorCheckpoint([base.replace('conclusion', 'OLD conclusion'), base]);
+  await engine.checkpointEditor(checkpoint, engine.snapshot().revision);
+  await engine.receiveRemote({ content: base.replace('conclusion', 'THEIR conclusion'), version: 2 });
+  await engine.prepareEditorUpdate(engine.snapshot().revision);
+  const revision = engine.snapshot().revision;
+  await engine.receiveRemote({ content: base.replace('conclusion', 'NEW THEIR conclusion'), version: 3 });
+  await assert.rejects(engine.prepareHistoryResolution({ 0: 'choice' }, revision), { code: 'STALE_REVISION' });
+  const changed = editorCheckpoint([base.replace('conclusion', 'OLD conclusion'), base.replace('conclusion', 'MY conclusion')]);
+  await saveEditor(engine, changed, engine.snapshot().revision);
+  assert.ok(engine.snapshot().conflict);
+  const before = engine.snapshot();
+  await assert.rejects(engine.prepareHistoryResolution({ 0: 'choice' }, before.revision), { code: 'DOCUMENT_CONFLICT' });
+  assert.deepEqual(engine.snapshot(), before);
+});
+
+test('document resolution keeps saved and unsaved text separate and verifies the entire native history before acceptance', async t => {
+  const { engine, store } = await fixture(t);
+  await engine.checkpointEditor(editorCheckpoint([base]), engine.snapshot().revision);
+  const local = base.replace('introduction', 'MY introduction');
+  await saveEditor(engine, editorCheckpoint([base, local]), engine.snapshot().revision);
+  const unsaved = local.replace('conclusion', 'UNSAVED conclusion');
+  const captured = editorCheckpoint([base, local, unsaved]);
+  await engine.checkpointEditor(captured, engine.snapshot().revision);
+  const remote = base.replace('introduction', 'THEIR introduction');
+  await engine.receiveRemote({ content: remote, version: 2 });
+  const conflict = engine.snapshot().conflict;
+  const review = await engine.prepareConflictResolution(conflict.id, {}, engine.snapshot().revision);
+  assert.equal(review.stage, 'saved');
+  assert.equal(review.inputs.local, local);
+  assert.equal(review.inputs.remote, remote);
+  assert.equal(engine.snapshot().saved, local);
+  const saved = base.replace('introduction', 'RESOLVED introduction');
+  const historical = await engine.prepareConflictResolution(conflict.id, { saved }, engine.snapshot().revision);
+  assert.equal(historical.stage, 'history');
+  assert.equal(historical.seq, 0);
+  assert.equal((await store.read('doc')).state.editor.conflictReview.choices.saved, saved);
+  assert.deepEqual(engine.snapshot().editor.checkpoint, captured);
+  const proposal = await engine.prepareConflictResolution(conflict.id, { saved, history: { 0: remote } }, engine.snapshot().revision);
+  assert.equal(proposal.status, 'ready');
+  assert.equal(proposal.content, saved.replace('conclusion', 'UNSAVED conclusion'));
+  assert.equal(engine.snapshot().saved, local, 'reviewing a candidate must not publish it');
+  await engine.acceptEditorUpdate(proposal.token, { ...captured, history: proposal.history });
+  assert.equal(engine.snapshot().conflict, null);
+  assert.equal(engine.snapshot().saved, saved);
+  assert.equal(engine.snapshot().buffer, proposal.content);
+  assert.equal(engine.snapshot().editor.checkpoint.history.nodes[0].content, remote);
+  assert.equal(engine.snapshot().recovery.conflict.conflict.id, conflict.id);
+  assert.equal((await engine.prepareUpload()).content, saved);
+});
+
+test('document resolution requests an explicit dirty-buffer choice when saved resolution overlaps unsaved text', async t => {
+  const { engine } = await fixture(t);
+  await engine.checkpointEditor(editorCheckpoint([base]), engine.snapshot().revision);
+  const local = base.replace('introduction', 'LOCAL');
+  await saveEditor(engine, editorCheckpoint([base, local]), engine.snapshot().revision);
+  const current = base.replace('introduction', 'UNSAVED LOCAL');
+  await engine.checkpointEditor(editorCheckpoint([base, local, current]), engine.snapshot().revision);
+  await engine.receiveRemote({ content: base.replace('introduction', 'REMOTE'), version: 2 });
+  const id = engine.snapshot().conflict.id;
+  const saved = base.replace('introduction', 'RESOLVED');
+  const proposal = await engine.prepareConflictResolution(id, { saved }, engine.snapshot().revision);
+  assert.equal(proposal.stage, 'buffer');
+  assert.equal(proposal.inputs.local, current);
+  assert.equal(proposal.inputs.remote, saved);
+  assert.equal(engine.snapshot().saved, local);
+  assert.equal(engine.snapshot().editor.checkpoint.history.nodes.at(-1).content, current);
+});
+
+test('document resolution rejects stale remote revisions after preparation and retains the unresolved originals', async t => {
+  const { engine } = await fixture(t);
+  await engine.checkpointEditor(editorCheckpoint([base]), engine.snapshot().revision);
+  const local = base.replace('introduction', 'LOCAL');
+  await saveEditor(engine, editorCheckpoint([base, local]), engine.snapshot().revision);
+  const remote = base.replace('introduction', 'REMOTE');
+  await engine.receiveRemote({ content: remote, version: 2 });
+  const id = engine.snapshot().conflict.id;
+  const proposal = await engine.prepareConflictResolution(id, { saved: remote, history: { 0: remote } }, engine.snapshot().revision);
+  assert.equal(proposal.status, 'ready');
+  await engine.receiveRemote({ content: remote + 'NEWER', version: 3 });
+  const before = engine.snapshot();
+  await assert.rejects(engine.acceptEditorUpdate(proposal.token, { ...before.editor.checkpoint, history: proposal.history }), { code: 'STALE_CONFLICT' });
+  assert.deepEqual(engine.snapshot(), before);
+  await assert.rejects(engine.prepareConflictResolution(id, { saved: '<<<<<<< LOCAL' }, before.revision), { code: 'INVALID_RESOLUTION' });
+});
+
+test('native conflict resolution cannot retire an unconfirmed submission', async t => {
+  const { engine } = await fixture(t);
+  await engine.checkpointEditor(editorCheckpoint([base]), engine.snapshot().revision);
+  const local = base.replace('introduction', 'LOCAL');
+  await saveEditor(engine, editorCheckpoint([base, local]), engine.snapshot().revision);
+  const pending = await engine.prepareUpload('old-connection');
+  await engine.markUncertain(pending.token);
+  const before = engine.snapshot();
+  await assert.rejects(engine.prepareConflictResolution(before.conflict.id, { saved: local }, before.revision), { code: 'UPLOAD_PENDING' });
+  assert.deepEqual(engine.snapshot(), before);
+});
+
+test('partial native history choices survive reopening without changing the archived native tree', async t => {
+  const { engine, store } = await fixture(t);
+  const checkpoint = editorCheckpoint([base.replace('conclusion', 'OLD'), base, base.replace('conclusion', 'ALTERNATE')], 1);
+  await engine.checkpointEditor(checkpoint, engine.snapshot().revision);
+  await engine.receiveRemote({ content: base.replace('conclusion', 'THEIR'), version: 2 });
+  await engine.prepareEditorUpdate(engine.snapshot().revision);
+  const choices = { 0: base.replace('conclusion', 'OLD with THEIR') };
+  const partial = await engine.prepareHistoryResolution(choices, engine.snapshot().revision);
+  assert.equal(partial.status, 'conflict');
+  assert.equal(partial.seq, 2);
+  const reopened = await DocumentEngine.open(store, 'doc');
+  assert.deepEqual(reopened.snapshot().editor.checkpoint, checkpoint);
+  assert.deepEqual(reopened.snapshot().editor.historyReview.resolutions, choices);
+  assert.equal(reopened.snapshot().editor.pending, null);
 });

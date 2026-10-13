@@ -49,25 +49,42 @@ function captureHistory(history) {
 
 /** Rebase the complete native undo tree, including inactive branches. A conflict
  * holds the whole editor update; callers must never install a partial tree. */
-async function rebaseHistory(history, content) {
+async function rebaseHistory(history, content, { resolutions = {} } = {}) {
   validateText(content, 'updated buffer content');
   const captured = captureHistory(history);
+  const invalid = message => { throw Object.assign(new Error(message), { code: 'INVALID_RESOLUTION' }); };
+  if (!resolutions || typeof resolutions !== 'object' || Array.isArray(resolutions)) invalid('History choices must be keyed by native sequence ID');
+  const sequences = new Set(captured.nodes.map(node => String(node.seq)));
+  for (const [seq, choice] of Object.entries(resolutions)) {
+    if (!sequences.has(seq)) invalid('History choice refers to an unknown sequence');
+    validateText(choice, 'history resolution');
+    if (/^(?:<{7}|\|{7}|={7}|>{7})(?:\s|$)/m.test(choice)) invalid('History choice contains conflict markers');
+  }
   const base = captured.nodes.find(node => node.seq === captured.current).content;
   const results = new Map();
   let bytes = 0;
-  for (const node of captured.nodes) {
-    let merged = results.get(node.content);
-    if (!merged) {
-      merged = await mergeText({ base, local: node.content, remote: content });
-      results.set(node.content, merged);
+  // Bound process concurrency and settle each batch before returning. Consume
+  // results in sequence order so the first conflict/error remains deterministic.
+  for (let start = 0; start < captured.nodes.length; start += 4) {
+    const batch = captured.nodes.slice(start, start + 4);
+    const outcomes = await Promise.allSettled(batch.map(node => {
+      if (!results.has(node.content)) results.set(node.content, mergeText({ base, local: node.content, remote: content }));
+      return results.get(node.content);
+    }));
+    for (const [index, node] of batch.entries()) {
+      if (outcomes[index].status === 'rejected') throw outcomes[index].reason;
+      let merged = outcomes[index].value;
+      if (merged.status === 'conflict') {
+        if (!Object.hasOwn(resolutions, node.seq)) return { ...merged, seq: node.seq };
+        merged = { status: 'clean', content: resolutions[node.seq] };
+      } else if (Object.hasOwn(resolutions, node.seq)) invalid('A history choice may only replace a conflicting state');
+      bytes += Buffer.byteLength(merged.content);
+      if (bytes > MAX_BYTES) {
+        throw Object.assign(new Error('Rebased undo history exceeds the automatic rebase limit'), { code: 'HISTORY_LIMIT' });
+      }
+      if (node.empty !== undefined && merged.content !== node.content) node.empty = merged.content === '';
+      node.content = merged.content;
     }
-    if (merged.status === 'conflict') return { ...merged, seq: node.seq };
-    bytes += Buffer.byteLength(merged.content);
-    if (bytes > MAX_BYTES) {
-      throw Object.assign(new Error('Rebased undo history exceeds the automatic rebase limit'), { code: 'HISTORY_LIMIT' });
-    }
-    if (node.empty !== undefined && merged.content !== node.content) node.empty = merged.content === '';
-    node.content = merged.content;
   }
   return { status: 'clean', history: captured };
 }
@@ -101,23 +118,23 @@ function currentText(checkpoint, options) {
 /** Merge exact file text, then return native joined lines under the existing
  * editor options. Native undo does not track option changes; hold any result
  * that cannot be represented without changing them. */
-async function rebaseEditorHistory(checkpoint, content) {
+async function rebaseEditorHistory(checkpoint, content, { forWrite = false, resolutions = {} } = {}) {
   const { history, options } = captureEditorCheckpoint(checkpoint);
   const raw = {
     ...history,
-    nodes: history.nodes.map(node => ({ seq: node.seq, parent: node.parent, content: editorText({ ...node, options }) })),
+    nodes: history.nodes.map(node => ({ seq: node.seq, parent: node.parent, content: editorText({ ...node, options }, { forWrite }) })),
   };
-  const result = await rebaseHistory(raw, content);
+  const result = await rebaseHistory(raw, content, { resolutions });
   if (result.status !== 'clean') return result;
   for (let index = 0; index < result.history.nodes.length; index++) {
     const node = result.history.nodes[index];
     const decoded = decodeText(node.content, options);
     // With noeol, a trailing separator is a native empty final line, not a
     // reason to change the user's endofline option during a history import.
-    if (!options.endofline && decoded.options.endofline) decoded.content += '\n';
+    if (!options.endofline && decoded.options.endofline && !(forWrite && options.fixendofline)) decoded.content += '\n';
     const original = history.nodes[index];
     if (original.content === decoded.content && raw.nodes[index].content === node.content) decoded.empty = original.empty;
-    if (editorText({ ...decoded, options }) !== node.content) {
+    if (editorText({ ...decoded, options }, { forWrite }) !== node.content) {
       return { status: 'held', reason: 'text-options' };
     }
     node.content = decoded.content;
@@ -126,4 +143,19 @@ async function rebaseEditorHistory(checkpoint, content) {
   return result;
 }
 
-module.exports = { rebaseHistory, rebaseEditorHistory, captureEditorCheckpoint, currentText };
+/** Persistent undo is loaded against native readback lines. Only the saved
+ * current state changes representation; older native line states and all branch
+ * identities remain intact. Neovim does not store per-state newline options. */
+function persistentView(checkpoint) {
+  const { history, options } = captureEditorCheckpoint(checkpoint);
+  const current = history.nodes.find(node => node.seq === history.current);
+  if (!options.endofline && !options.fixendofline) {
+    if (current.content.endsWith('\n')) {
+      current.content = current.content.slice(0, -1);
+      options.endofline = true;
+    } else if (current.content === '') current.empty = true;
+  }
+  return { history, options };
+}
+
+module.exports = { rebaseHistory, rebaseEditorHistory, captureEditorCheckpoint, currentText, persistentView };

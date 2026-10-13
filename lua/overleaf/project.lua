@@ -206,6 +206,27 @@ function M.rename_entry(entity_id, new_name)
   return nil
 end
 
+function M.move_entry(entity_id, folder_id)
+  local entry = M.get_entry_by_id(entity_id)
+  if not entry then return nil end
+  local folder = folder_id and M.get_entry_by_id(folder_id)
+  -- The server root folder is not represented in the flat tree.
+  local parent = folder and folder.type == 'folder' and folder.path or ''
+  local old_path, old_depth = entry.path, entry.depth or 0
+  if entry.type == 'folder' and parent:sub(1, #old_path) == old_path then return nil end
+  entry.path = parent .. entry.name .. (entry.type == 'folder' and '/' or '')
+  entry.depth = folder and (folder.depth or 0) + 1 or 0
+  if entry.type == 'folder' then
+    for _, child in ipairs(M._project_tree) do
+      if child ~= entry and child.path:sub(1, #old_path) == old_path then
+        child.path = entry.path .. child.path:sub(#old_path + 1)
+        child.depth = (child.depth or old_depth + 1) + entry.depth - old_depth
+      end
+    end
+  end
+  return entry
+end
+
 --- Update an entry's ID (used for file-restore where the doc gets a new _id)
 function M.update_entry_id(old_id, new_id)
   for _, entry in ipairs(M._project_tree) do

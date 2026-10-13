@@ -57,74 +57,102 @@ describe('creating comments', function()
     end
   end)
 
-  it('posts a thread message and submits a range OT op for the visual selection', function()
+  it('routes a native Unicode selection through the owned comment API without legacy OT', function()
+    local sync = require('overleaf.sync')
+    local old_workspace = sync._workspace
     local bufnr = vim.api.nvim_create_buf(true, false)
     vim.b[bufnr].overleaf_comment_create_test = true
     vim.api.nvim_set_current_buf(bufnr)
-    vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { 'abcde' })
-
-    local submitted_ops
-    overleaf._state.documents['doc-1'] = {
-      bufnr = bufnr,
-      joined = true,
-      content = 'abcde',
-      check_content = function() return true end,
-      submit_op = function(_, ops) submitted_ops = ops end,
-    }
-
-    vim.fn.setpos("'<", { bufnr, 1, 2, 0 })
-    vim.fn.setpos("'>", { bufnr, 1, 3, 0 })
-
-    local posted_thread_id
-    vim.ui.input = function(opts, callback)
-      assert.are.equal('Comment: ', opts.prompt)
-      callback('Please revise')
-    end
-
+    vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { 'UNSAVED é😀 abc' })
+    local doc = { bufnr = bufnr, doc_id = 'doc-1', engine = true, joined = true, content = 'UNSAVED é😀 abc' }
+    overleaf._state.documents['doc-1'] = doc
+    sync._workspace = { session = 'session', documents = overleaf._state.documents }
+    vim.fn.setpos("'<", { bufnr, 1, 16, 0 })
+    vim.fn.setpos("'>", { bufnr, 1, 18, 0 })
+    local posted
+    vim.ui.input = function(_, callback) callback('Review') end
     bridge.request = function(method, params, callback)
-      assert.are.equal('addComment', method)
-      assert.are.equal('cookie', params.cookie)
-      assert.are.equal('csrf', params.csrfToken)
-      assert.are.equal('project-1', params.projectId)
-      assert.are.equal('Please revise', params.content)
-      assert.are.equal(24, #params.threadId)
-      assert.is_truthy(params.threadId:match('^%x+$'))
-      posted_thread_id = params.threadId
-
-      callback(nil, {
-        content = params.content,
-        user = { email = 'ada@example.com' },
-        timestamp = 1710000000000,
-      })
+      if method == 'syncComment' then
+        posted = params
+        callback(nil, { status = 'queued' })
+      elseif method == 'getThreads' then
+        callback(nil, {})
+      elseif method == 'syncDocument' then
+        callback(nil, { result = { comments = {} } })
+      else
+        error('Unexpected request: ' .. method)
+      end
     end
-
-    overleaf.create_comment_from_selection()
-
-    assert.are.same({
-      {
-        p = 1,
-        c = 'bc',
-        t = posted_thread_id,
-      },
-    }, submitted_ops)
-
-    assert.are.equal(1, #comments._doc_comments['doc-1'])
-    assert.are.equal(posted_thread_id, comments._doc_comments['doc-1'][1].threadId)
-    assert.are.equal(1, comments._doc_comments['doc-1'][1].offset)
-    assert.are.equal(2, comments._doc_comments['doc-1'][1].length)
-    assert.are.equal('bc', comments._doc_comments['doc-1'][1].content)
-
-    local thread = comments._threads[posted_thread_id]
-    assert.are.equal('Please revise', thread.messages[1].content)
-    assert.are.equal(posted_thread_id, overleaf._state.documents['doc-1'].ranges.comments[1].op.t)
-    assert.are.equal('bc', overleaf._state.documents['doc-1'].ranges.comments[1].op.c)
-
-    vim.wait(1000, function()
-      return #vim.diagnostic.get(bufnr, { namespace = comments._diag_ns }) == 1
+    local ok, problem = pcall(function()
+      overleaf.create_comment_from_selection()
+      assert.is_not_nil(posted)
+      assert.are.equal('session', posted.session)
+      assert.are.equal('doc-1', posted.document)
+      assert.are.equal('UNSAVED é😀 abc', posted.selection.view)
+      assert.are.same({ row = 0, col = 15 }, posted.selection.start)
+      assert.are.same({ row = 0, col = 18 }, posted.selection['end'])
+      assert.are.equal('Review', posted.selection.message)
+      assert.are.equal('UNSAVED é😀 abc', vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)[1])
     end)
+    sync._workspace = old_workspace
+    assert.is_true(ok, tostring(problem))
+  end)
 
-    local diagnostic = vim.diagnostic.get(bufnr, { namespace = comments._diag_ns })[1]
-    assert.are.equal('overleaf-comment', diagnostic.source)
-    assert.are.equal(posted_thread_id, diagnostic.user_data.thread_id)
+  it('cancels a pending comment prompt when its buffer or project changes', function()
+    local sync = require('overleaf.sync')
+    local old_workspace = sync._workspace
+    local bufnr = vim.api.nvim_create_buf(true, false)
+    vim.b[bufnr].overleaf_comment_create_test = true
+    vim.api.nvim_set_current_buf(bufnr)
+    vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { 'abc' })
+    local doc = { bufnr = bufnr, doc_id = 'doc-1', engine = true, joined = true, content = 'abc' }
+    overleaf._state.documents['doc-1'] = doc
+    sync._workspace = { session = 'session', documents = overleaf._state.documents }
+    vim.fn.setpos("'<", { bufnr, 1, 1, 0 })
+    vim.fn.setpos("'>", { bufnr, 1, 3, 0 })
+    local input, requests = nil, 0
+    vim.ui.input = function(_, callback) input = callback end
+    bridge.request = function() requests = requests + 1 end
+    local ok, problem = pcall(function()
+      overleaf.create_comment_from_selection()
+      vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { 'changed' })
+      input('Review')
+      assert.are.equal(0, requests)
+      overleaf.create_comment_from_selection()
+      sync._workspace = { session = 'other', documents = {} }
+      input('Review')
+      assert.are.equal(0, requests)
+    end)
+    sync._workspace = old_workspace
+    assert.is_true(ok, tostring(problem))
+  end)
+
+  it('cancels a reply prompt across disconnect or reconnect without posting it', function()
+    local bufnr = vim.api.nvim_create_buf(true, false)
+    vim.b[bufnr].overleaf_comment_create_test = true
+    vim.api.nvim_set_current_buf(bufnr)
+    overleaf._state.documents['doc-1'] = { bufnr = bufnr, content = 'text' }
+    local old_thread, generation = comments.get_thread_at_cursor, overleaf._connection_generation
+    comments.get_thread_at_cursor = function() return { id = 'thread' } end
+    local input, requests = nil, 0
+    vim.ui.input = function(_, callback) input = callback end
+    bridge.request = function() requests = requests + 1 end
+    local ok, problem = pcall(function()
+      overleaf.reply_comment()
+      assert.is_function(input)
+      overleaf._state.connected = false
+      input('Offline reply')
+      assert.are.equal(0, requests)
+      overleaf._state.connected = true
+      overleaf.reply_comment()
+      overleaf._connection_generation = (generation or 0) + 1
+      input('Obsolete connection reply')
+      assert.are.equal(0, requests)
+      overleaf.reply_comment()
+      input('Current reply')
+      assert.are.equal(1, requests)
+    end)
+    comments.get_thread_at_cursor, overleaf._connection_generation = old_thread, generation
+    assert.is_true(ok, tostring(problem))
   end)
 end)

@@ -2,7 +2,7 @@
 
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
-const { rebaseHistory } = require('../../../node/sync/history');
+const { rebaseHistory, rebaseEditorHistory, currentText, persistentView } = require('../../../node/sync/history');
 
 const base = 'intro\nseparator\nending';
 const edited = 'MY intro\nseparator\nending';
@@ -11,6 +11,24 @@ const history = () => ({
   current: 1, preferred: 1,
   nodes: [{ seq: 0, parent: null, content: base }, { seq: 1, parent: 0, content: edited }],
 });
+
+for (const fileformat of ['unix', 'dos']) {
+  test('persistent history rebasing uses actual saved bytes with fixeol and ' + fileformat + ' lines', async () => {
+    const checkpoint = {
+      history: { ...history(), nodes: history().nodes.map(node => ({ ...node, empty: false })) },
+      tree: { seq_cur: 1, seq_last: 1 }, undo: Buffer.from('opaque native fixture').toString('base64'),
+      options: { fileformat, fileencoding: 'utf-8', binary: false, endofline: false, fixendofline: true, bomb: true, undolevels: 1000 },
+    };
+    const separator = fileformat === 'dos' ? '\r\n' : '\n';
+    const saved = '\ufeff' + incoming.replaceAll('\n', separator) + separator;
+    const result = await rebaseEditorHistory(checkpoint, saved, { forWrite: true });
+    assert.equal(result.status, 'clean');
+    assert.equal(result.history.nodes[1].content, incoming);
+    assert.equal(result.history.nodes[0].content, base.replace('ending', 'THEIR ending'));
+    assert.equal(currentText({ ...checkpoint, history: result.history }, { forWrite: true }), saved);
+    assert.equal(checkpoint.history.nodes[1].content, edited);
+  });
+}
 
 test('rebases the current text and every undo state without adding an incoming undo entry', async () => {
   const original = history();
@@ -40,6 +58,20 @@ test('preserves redo and alternate branches when rebasing from an undone state',
   assert.equal(result.history.nodes[2].content, 'MY second intro\nseparator\nTHEIR ending');
   assert.equal(result.history.nodes[3].content, 'MY alternate intro\nseparator\nTHEIR ending');
   assert.deepEqual(result.history.nodes.map(n => [n.seq, n.parent]), [[0, null], [1, 0], [2, 1], [3, 1]]);
+});
+
+test('rebases a broad undo graph completely while preserving every branch and repeated text state', async () => {
+  const nodes = [{ seq: 0, parent: null, content: base }];
+  for (let seq = 1; seq <= 100; seq++) {
+    nodes.push({ seq, parent: 0, content: (seq % 5) + ' ' + base });
+  }
+  const original = { current: 1, preferred: 1, nodes };
+  const frozen = structuredClone(original);
+  const updated = original.nodes[1].content.replace('ending', 'THEIR ending');
+  const result = await rebaseHistory(original, updated);
+  assert.equal(result.status, 'clean');
+  assert.deepEqual(result.history, { ...original, nodes: nodes.map(node => ({ ...node, content: node.content.replace('ending', 'THEIR ending') })) });
+  assert.deepEqual(original, frozen);
 });
 
 test('an overlapping historical state holds the entire update and preserves the original history', async () => {
@@ -127,4 +159,66 @@ test('holds oversized histories and oversized rebased results rather than droppi
   ] };
   await assert.rejects(rebaseHistory(small, large), { code: 'HISTORY_LIMIT' });
   assert.deepEqual(small.nodes.map(node => node.content), ['', '']);
+});
+
+for (const [content, normalized, empty, endofline] of [
+  ['first\n', 'first', false, true], ['first\n\n', 'first\n', false, true],
+  ['\n', '', false, true], ['', '', true, false], ['first', 'first', false, false],
+]) {
+  test('persistent readback normalizes only the saved state: ' + JSON.stringify(content), () => {
+    const checkpoint = {
+      history: { ...history(), nodes: history().nodes.map(node => ({ ...node, empty: false })) },
+      tree: { seq_cur: 1, seq_last: 1 }, undo: Buffer.from('native').toString('base64'),
+      options: { fileformat: 'unix', fileencoding: 'utf-8', binary: false, endofline: false, fixendofline: false, bomb: false, undolevels: 1000 },
+    };
+    checkpoint.history.nodes[1].content = content;
+    const before = structuredClone(checkpoint);
+    const result = persistentView(checkpoint);
+    assert.equal(result.history.nodes[1].content, normalized);
+    assert.equal(result.history.nodes[1].empty, empty);
+    assert.equal(result.options.endofline, endofline);
+    assert.deepEqual(result.history.nodes[0], checkpoint.history.nodes[0]);
+    assert.equal(currentText({ ...checkpoint, ...result }, { forWrite: true }), currentText(checkpoint, { forWrite: true }));
+    assert.deepEqual(checkpoint, before);
+  });
+}
+
+test('explicit historical conflict choices preserve every undo and inactive branch', async () => {
+  const original = history();
+  original.nodes.push({ seq: 2, parent: 0, content: 'ALTERNATE intro\nseparator\nending' });
+  const target = 'MY intro expanded by colleague\nseparator\nending';
+  const root = 'intro expanded by colleague\nseparator\nending';
+  const partial = await rebaseHistory(original, target, { resolutions: { 0: root } });
+  assert.equal(partial.status, 'conflict');
+  assert.equal(partial.seq, 2);
+  assert.equal(partial.history, undefined);
+  const alternative = 'ALTERNATE intro expanded by colleague\nseparator\nending';
+  const result = await rebaseHistory(original, target, { resolutions: { 0: root, 2: alternative } });
+  assert.equal(result.status, 'clean');
+  assert.deepEqual(result.history.nodes.map(node => node.content), [root, target, alternative]);
+  assert.deepEqual(result.history.nodes.map(node => [node.seq, node.parent]), [[0, null], [1, 0], [2, 0]]);
+  assert.equal(original.nodes[0].content, base);
+});
+
+test('historical choices cannot change clean states, unknown nodes, or contain unresolved markers', async () => {
+  const target = 'MY intro expanded by colleague\nseparator\nending';
+  for (const resolutions of [{ 77: 'unknown' }, { 0: 'resolved', 1: 'overwritten current' }, { 0: '<<<<<<< LOCAL\nbroken' }]) {
+    await assert.rejects(rebaseHistory(history(), target, { resolutions }), { code: 'INVALID_RESOLUTION' });
+  }
+});
+
+test('native historical choices use exact BOM and DOS bytes and keep native options unchanged', async () => {
+  const checkpoint = {
+    history: { ...history(), nodes: history().nodes.map(node => ({ ...node, empty: false })) },
+    tree: { seq_cur: 1, seq_last: 1 }, undo: Buffer.from('opaque fixture').toString('base64'),
+    options: { fileformat: 'dos', fileencoding: 'utf-8', endofline: true, fixendofline: true, bomb: true, binary: false, undolevels: 1000 },
+  };
+  const raw = text => '\ufeff' + text.replaceAll('\n', '\r\n') + '\r\n';
+  const target = 'MY intro expanded by colleague\nseparator\nending';
+  const root = 'intro expanded by colleague\nseparator\nending';
+  const result = await rebaseEditorHistory(checkpoint, raw(target), { resolutions: { 0: raw(root) } });
+  assert.equal(result.status, 'clean');
+  assert.equal(result.history.nodes[0].content, root);
+  assert.equal(result.history.nodes[1].content, target);
+  assert.equal(currentText({ ...checkpoint, history: result.history }), raw(target));
 });

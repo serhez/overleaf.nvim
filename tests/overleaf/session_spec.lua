@@ -129,6 +129,26 @@ describe('durable editor sessions', function()
     idle()
   end
 
+  for _, mode in ipairs({ 'v', 'V', '\22' }) do
+    it(
+      'defers incoming buffer installation during ' .. vim.inspect(mode) .. ' selection and resumes on leaving it',
+      function()
+        vim.api.nvim_win_set_cursor(0, { 3, 1 })
+        vim.cmd('normal! ' .. mode)
+        vim.cmd('normal! l')
+        local cursor, anchor = vim.api.nvim_win_get_cursor(0), vim.fn.getpos('v')
+        document('remote', { remote = { content = 'intro\nseparator\nTHEIR ending', version = 2 } })
+        client:refresh()
+        vim.wait(100, function() return false end, 10)
+        local actual = { text(buf), vim.fn.mode(), vim.api.nvim_win_get_cursor(0), vim.fn.getpos('v') }
+        vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes('<Esc>', true, false, true), 'nx', false)
+        assert.are.same({ base, mode, cursor, anchor }, actual)
+        idle()
+        assert.are.equal('intro\nseparator\nTHEIR ending', text(buf))
+      end
+    )
+  end
+
   after_each(function()
     if client then
       for _, directory in ipairs(client:stop()) do
@@ -297,6 +317,51 @@ describe('durable editor sessions', function()
     assert.are.equal(base:gsub('ending', 'THEIR ending'), document('snapshot').result.saved)
   end)
 
+  it('rebases a long undo history again after sustained edits outdate an incoming proposal', function()
+    for i = 1, 128 do
+      set(buf, 'local ' .. i .. '\nseparator\nending')
+    end
+    client:refresh()
+    idle()
+    delay_action = 'prepare'
+    document('remote', { remote = { content = base:gsub('ending', 'THEIR ending'), version = 2 } })
+    assert.is_true(vim.wait(5000, function() return #delayed == 1 end))
+    for i = 129, 160 do
+      set(buf, 'local ' .. i .. '\nseparator\nending')
+      client:refresh()
+    end
+    local before = vim.fn.undotree()
+    table.remove(delayed, 1)()
+    idle()
+    assert.are.same(before, vim.fn.undotree())
+    assert.are.equal('local 160\nseparator\nTHEIR ending', text(buf))
+    vim.cmd('silent undo 80')
+    assert.are.equal('local 80\nseparator\nTHEIR ending', text(buf))
+    vim.cmd('silent undo 0')
+    assert.are.equal(base:gsub('ending', 'THEIR ending'), text(buf))
+    assert.are.equal(base:gsub('ending', 'THEIR ending'), document('snapshot').result.saved)
+  end)
+
+  it('captures the latest native text and undo when detached before its scheduled checkpoint', function()
+    set(buf, second)
+    local before = vim.fn.undotree()
+    local paths = client:stop()
+    assert.is_true(#paths > 0)
+    local found = false
+    for _, directory in ipairs(paths) do
+      recovery[directory] = true
+      local snapshot = vim.json.decode(table.concat(vim.fn.readfile(directory .. '/snapshot.json'), '\n'))
+      if snapshot.content == second then
+        found = true
+        assert.are.equal(before.seq_cur, snapshot.history.current)
+      end
+    end
+    assert.is_true(found)
+    assert.are.equal(second, text(buf))
+    assert.are.same(before, vim.fn.undotree())
+    assert.is_true(vim.bo[buf].modified)
+  end)
+
   it('ignores callbacks after detaching even if the buffer is reused', function()
     delay_action = 'prepare'
     document('remote', { remote = { content = base:gsub('ending', 'THEIR ending'), version = 2 } })
@@ -371,5 +436,79 @@ describe('durable editor sessions', function()
     assert.is_true(vim.wait(5000, function() return started end))
     assert.is_nil(failure)
     assert.are.equal('ok', rpc('ping', {}).status)
+  end)
+  it('resolves an overlapping historical state while preserving native undo and the current peer edit', function()
+    set(buf, 'OLD intro\nseparator\nending')
+    set(buf, base)
+    idle()
+    local incoming = 'THEIR intro\nseparator\nending'
+    document('remote', { remote = { content = incoming, version = 2 } })
+    client:refresh()
+    idle()
+    assert.are.equal('history-conflict', statuses[#statuses].detail.reason)
+    local before = vim.api.nvim_buf_call(buf, vim.fn.undotree)
+    local review = client:review_history()
+    local conflict = client:resolve_history(review, {})
+    assert.are.equal('conflict', conflict.status)
+    assert.are.equal(1, conflict.seq)
+    assert.are.equal(base, text(buf))
+    local result = client:resolve_history(review, { ['1'] = 'OLD with THEIR intro\nseparator\nending' })
+    assert.are.equal('accepted', result.status)
+    idle()
+    assert.are.equal(incoming, text(buf))
+    local after = vim.api.nvim_buf_call(buf, vim.fn.undotree)
+    assert.are.equal(before.seq_cur, after.seq_cur)
+    assert.are.equal(before.seq_last, after.seq_last)
+    vim.api.nvim_buf_call(buf, function() vim.cmd('undo') end)
+    assert.are.equal('OLD with THEIR intro\nseparator\nending', text(buf))
+    vim.api.nvim_buf_call(buf, function() vim.cmd('undo') end)
+    assert.are.equal(incoming, text(buf))
+    local disk = assert(io.open(root .. '/main.tex', 'rb'))
+    assert.are.equal(base, disk:read('*a'))
+    disk:close()
+  end)
+
+  it('rejects history choices after newer typing without replacing text or history', function()
+    set(buf, 'OLD intro\nseparator\nending')
+    set(buf, base)
+    idle()
+    document('remote', { remote = { content = 'THEIR intro\nseparator\nending', version = 2 } })
+    client:refresh()
+    idle()
+    local review = client:review_history()
+    set(buf, 'NEW typing\nseparator\nending')
+    local tree = vim.api.nvim_buf_call(buf, vim.fn.undotree)
+    local ok = pcall(client.resolve_history, client, review, { ['1'] = 'choice' })
+    assert.is_false(ok)
+    assert.are.equal('NEW typing\nseparator\nending', text(buf))
+    assert.are.same(tree, vim.api.nvim_buf_call(buf, vim.fn.undotree))
+  end)
+  it('resolves saved text independently from dirty text through the real bridge and native undo', function()
+    set(buf, first)
+    vim.api.nvim_buf_call(buf, function() vim.cmd('write') end)
+    idle()
+    local unsaved = 'MY intro\nseparator\nUNSAVED ending'
+    set(buf, unsaved)
+    idle()
+    local incoming = 'THEIR intro\nseparator\nending'
+    document('remote', { remote = { content = incoming, version = 2 } })
+    client:refresh()
+    idle()
+    local review = client:review_conflict()
+    local saved = 'RESOLVED intro\nseparator\nending'
+    local partial = client:resolve_conflict(review, { saved = saved })
+    assert.are.equal('history', partial.stage)
+    assert.are.equal(unsaved, text(buf))
+    local accepted = client:resolve_conflict(review, { saved = saved, history = { ['0'] = incoming } })
+    assert.are.equal('accepted', accepted.status)
+    idle()
+    assert.are.equal('RESOLVED intro\nseparator\nUNSAVED ending', text(buf))
+    local state = document('snapshot').result
+    assert.are.equal(saved, state.saved)
+    assert.are.equal(vim.NIL, state.conflict)
+    vim.api.nvim_buf_call(buf, function() vim.cmd('undo') end)
+    assert.are.equal(saved, text(buf))
+    vim.api.nvim_buf_call(buf, function() vim.cmd('undo') end)
+    assert.are.equal(incoming, text(buf))
   end)
 end)

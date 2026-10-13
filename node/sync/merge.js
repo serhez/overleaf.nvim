@@ -69,4 +69,41 @@ async function mergeText({ base, local, remote }, { gitPath = 'git' } = {}) {
   }
 }
 
-module.exports = { mergeText, validateText };
+/** A disposable repository for an external merge UI. All Git state is private;
+ * original conflict output is retained separately because UIs may replace it. */
+async function createConflictWorkspace(inputs, candidate, { root = os.tmpdir(), gitPath = 'git' } = {}) {
+  if (inputs.base === null) throw Object.assign(new Error('Use the native review when ancestry is unknown'), { code: 'NO_MERGE_BASE' });
+  for (const [name, value] of Object.entries({ base: inputs.base, local: inputs.local, remote: inputs.remote, candidate })) {
+    validateText(value, name);
+    if (Buffer.byteLength(value) > 16 * 1024 * 1024) throw Object.assign(new Error('Merge view exceeds the text limit'), { code: 'MERGE_LIMIT' });
+  }
+  const directory = await fs.mkdtemp(path.join(root, 'overleaf-merge-view-'));
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
+  env.GIT_CONFIG_NOSYSTEM = '1'; env.GIT_CONFIG_GLOBAL = os.devNull;
+  const git = (args, input) => new Promise((resolve, reject) => {
+    const child = execFile(gitPath, args, { cwd: directory, env, encoding: 'utf8', timeout: 10000, maxBuffer: 65536 },
+      (error, stdout) => error ? reject(error) : resolve(stdout.trim()));
+    child.stdin.on('error', () => {});
+    child.stdin.end(input);
+  });
+  try {
+    await git(['init', '--quiet', '--template=']);
+    const records = [];
+    for (const [index, name] of ['base', 'local', 'remote'].entries()) {
+      const hash = await git(['hash-object', '-w', '--stdin'], inputs[name]);
+      if (!/^[a-f0-9]{40,64}$/.test(hash)) throw new Error('Invalid Git object identity');
+      records.push(`100644 ${hash} ${index + 1}\tresult\n`);
+    }
+    await git(['update-index', '--index-info'], records.join(''));
+    const filename = path.join(directory, 'result'), original = path.join(directory, 'candidate');
+    await fs.writeFile(filename, candidate, { flag: 'wx', mode: 0o600 });
+    await fs.writeFile(original, candidate, { flag: 'wx', mode: 0o600 });
+    return { directory, path: filename, candidate: original };
+  } catch (error) {
+    // A failed preparation has never been handed to an editor or user.
+    await fs.rm(directory, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+module.exports = { mergeText, validateText, createConflictWorkspace };

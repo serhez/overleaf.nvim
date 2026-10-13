@@ -9,6 +9,10 @@ local commands = {
   projects = function() require('overleaf').projects() end,
   status = function() require('overleaf').status() end,
   disconnect = function() require('overleaf').disconnect() end,
+  conflicts = function() require('overleaf').conflicts() end,
+  resolve = function(args) require('overleaf').resolve(args[1]) end,
+  recover = function(args) require('overleaf').recover(args[1]) end,
+  migrate = function(args) require('overleaf').migrate(rest(args, 1)) end,
 
   explorer = function(args)
     if args[1] == 'native' then
@@ -45,7 +49,9 @@ local commands = {
   end,
 
   comments = function(args)
-    if args[1] == 'refresh' then
+    if args[1] == 'drafts' then
+      require('overleaf').comment_drafts()
+    elseif args[1] == 'refresh' then
       require('overleaf').refresh_comments()
     else
       require('overleaf').list_comments()
@@ -84,10 +90,12 @@ table.sort(completions)
 
 local subcommand_completions = {
   comment = { 'add', 'show', 'reply', 'resolve' },
-  comments = { 'refresh' },
+  comments = { 'refresh', 'drafts' },
   compile = { 'local', 'watch', 'stop' },
   explorer = { 'native' },
   sync = { 'import', 'export' },
+  resolve = { 'history', 'disk-history', 'codediff' },
+  recover = { 'locks' },
 }
 
 vim.api.nvim_create_user_command('Overleaf', function(opts)

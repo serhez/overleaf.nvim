@@ -61,4 +61,40 @@ function encodeEditor(view, options) {
   return Buffer.from(editorText(view, options), 'utf8');
 }
 
-module.exports = { decodeText, decodeBytes, editorText, encodeEditor };
+function checkFormat(format) {
+  if (!format || !['unix', 'dos'].includes(format.fileformat) || typeof format.bomb !== 'boolean') {
+    throw failure('UNSUPPORTED_TEXT', 'Wire conversion requires an explicit BOM and line-ending format');
+  }
+}
+
+function toWire(text, format) {
+  checkFormat(format);
+  validateText(text, 'saved file text');
+  if (format.bomb && !text.startsWith('\ufeff')) throw failure('UNSUPPORTED_TEXT', 'Saved text is missing its declared BOM');
+  let body = format.bomb ? text.slice(1) : text;
+  if (format.fileformat === 'dos') {
+    if (/(?<!\r)\n/.test(body)) throw failure('UNSUPPORTED_TEXT', 'Mixed separators cannot be published as DOS text');
+    body = body.replaceAll('\r\n', '\n');
+  }
+  if (body.includes('\r')) throw failure('UNSUPPORTED_TEXT', 'The server cannot preserve literal CR characters');
+  return body;
+}
+
+function fromWire(text, format) {
+  checkFormat(format);
+  validateText(text, 'wire text');
+  if (text.includes('\r')) throw failure('UNSUPPORTED_TEXT', 'Wire text must use logical LF separators');
+  return (format.bomb ? '\ufeff' : '') + (format.fileformat === 'dos' ? text.replaceAll('\n', '\r\n') : text);
+}
+
+/** Classify actual external bytes. With no separator, retain the established
+ * line convention; native saves instead supply their explicit captured options. */
+function fileFormat(text, fallback = { fileformat: 'unix' }) {
+  validateText(text, 'file text');
+  const format = { bomb: text.startsWith('\ufeff'), fileformat: text.includes('\r\n') ? 'dos'
+    : text.includes('\n') ? 'unix' : fallback.fileformat };
+  toWire(text, format);
+  return format;
+}
+
+module.exports = { decodeText, decodeBytes, editorText, encodeEditor, toWire, fromWire, fileFormat };

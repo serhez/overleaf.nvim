@@ -57,6 +57,10 @@ function M.on_client_updated(data)
   end
 
   -- Update position
+  if collab.doc_id and collab.doc_id ~= data.doc_id then
+    local previous = find_bufnr(collab.doc_id)
+    if previous then pcall(vim.api.nvim_buf_del_extmark, previous, M._ns, M._get_mark_id(user_id)) end
+  end
   if data.name then collab.name = data.name end
   collab.doc_id = data.doc_id
   collab.row = data.row or 0
@@ -90,18 +94,18 @@ function M.on_client_disconnected(data)
 end
 
 --- Render a single collaborator cursor as extmark
-function M._render_cursor(user_id, collab)
+local function render_at(user_id, collab, position)
   if not collab.doc_id then return end
 
   local bufnr = find_bufnr(collab.doc_id)
   if not bufnr then return end
 
   local line_count = vim.api.nvim_buf_line_count(bufnr)
-  local row = math.max(0, math.min(collab.row, line_count - 1))
+  local row = math.max(0, math.min(position.row, line_count - 1))
 
   -- Clamp column to line length
   local line_text = vim.api.nvim_buf_get_lines(bufnr, row, row + 1, false)[1] or ''
-  local col = math.max(0, math.min(collab.col, #line_text))
+  local col = math.max(0, math.min(position.col, #line_text))
 
   local hl_cursor = 'OverleafCursor' .. collab.color_idx
   local hl_name = 'OverleafCursorName' .. collab.color_idx
@@ -110,7 +114,9 @@ function M._render_cursor(user_id, collab)
   pcall(vim.api.nvim_buf_del_extmark, bufnr, M._ns, mark_id)
 
   -- Place extmark at exact row:col with a highlighted cursor character
-  local end_col = math.min(col + 1, #line_text)
+  local byte = line_text:byte(col + 1) or 0
+  local width = byte >= 240 and 4 or byte >= 224 and 3 or byte >= 192 and 2 or 1
+  local end_col = math.min(col + width, #line_text)
   pcall(vim.api.nvim_buf_set_extmark, bufnr, M._ns, row, col, {
     id = mark_id,
     end_col = end_col,
@@ -119,6 +125,23 @@ function M._render_cursor(user_id, collab)
     virt_text_pos = 'eol',
     priority = 100,
   })
+end
+
+function M._render_cursor(user_id, collab)
+  local sync = require('overleaf.sync')
+  local context = sync._workspace
+  local doc = context and context.documents[collab.doc_id]
+  if doc and doc.engine then
+    local token = {}
+    collab.request = token
+    sync.project_features(doc, { cursor = { row = collab.row, column = collab.col } }, function(err, result)
+      if M._collaborators[user_id] ~= collab or collab.request ~= token or collab.doc_id ~= doc.doc_id then return end
+      if err or type(result.cursor) ~= 'table' then return end
+      render_at(user_id, collab, result.cursor)
+    end)
+    return
+  end
+  render_at(user_id, collab, { row = collab.row, col = collab.col })
 end
 
 --- Generate a stable numeric mark ID from user_id string

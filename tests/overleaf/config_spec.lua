@@ -30,7 +30,7 @@ describe('config', function()
     end)
 
     it(
-      'cleans up virtual buffers on exit by default',
+      'cleans up UI launcher buffers on exit by default',
       function() assert.is_true(config.get().cleanup_buffers_on_exit) end
     )
   end)

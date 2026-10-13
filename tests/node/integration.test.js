@@ -238,6 +238,12 @@ async function runTests() {
     let session;
     try {
       session = (await bridge.request('syncOpen', options)).session;
+      const ownership = await bridge.request('syncInspectLocks', options);
+      assertEqual(ownership.locks[0].inspection.state, 'active');
+      await bridge.request('syncRecoverLocks', { review: ownership }).then(
+        () => { throw new Error('Running writer must not be released'); },
+        error => assertEqual(error.code, 'WRITER_ACTIVE'),
+      );
       const opened = await bridge.request('syncDocument', { session, document: 'doc', action: 'open', initial: { content: 'before', version: 1 } });
       assertEqual(opened.session, session);
       assertEqual(opened.document, 'doc');
@@ -337,6 +343,17 @@ async function runTests() {
     assertEqual(result.permissionsLevel, 'owner', 'permissions');
   });
 
+  await test('overlapping project connections cancel the obsolete request without leaving an old socket active', async () => {
+    const first = bridge.request('connect', { cookie: 'mock_session=test', projectId: 'obsolete_project' });
+    const second = bridge.request('connect', { cookie: 'mock_session=test', projectId: 'test_project' });
+    const results = await Promise.allSettled([first, second]);
+    assertEqual(results[0].status, 'rejected');
+    assertEqual(results[0].reason.code, 'CONNECTION_REPLACED');
+    assertEqual(results[1].status, 'fulfilled');
+    const joined = await bridge.request('joinDoc', { docId: 'connection_check' });
+    assert(Array.isArray(joined.lines), 'new connection remains usable');
+  });
+
   await test('compile rewrites cached output URLs', async () => {
     const result = await bridge.request('compile', {
       cookie: 'mock_session=test',
@@ -353,6 +370,235 @@ async function runTests() {
     assertIncludes(pdf.url, 'compileGroup=standard', 'compile group query');
     assertIncludes(pdf.url, 'clsiserverid=one-two-three-four-zonea', 'clsi server query');
     assertIncludes(pdf.url, 'enable_pdf_caching=true', 'pdf caching query');
+  });
+
+  await test('merge review RPC creates private conflict stages under the current recovery directory', async () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'overleaf-rpc-merge-')));
+    let session;
+    try {
+      const opened = await bridge.request('syncOpen', { root, server: `http://127.0.0.1:${port}`, projectId: 'merge-review' });
+      session = opened.session;
+      const review = await bridge.request('syncMergeView', { session,
+        inputs: { base: 'base', local: 'local', remote: 'remote' }, candidate: 'retained candidate' });
+      assert(review.directory.startsWith(opened.directory + path.sep + 'merge-views' + path.sep));
+      assert(fs.existsSync(path.join(review.directory, '.git', 'index')));
+      assertEqual(fs.readFileSync(review.path, 'utf8'), 'retained candidate');
+      assertEqual(fs.readFileSync(review.candidate, 'utf8'), 'retained candidate');
+    } finally {
+      if (session) await bridge.request('syncClose', { session });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  await test('comment messages and anchors use durable owned state without publishing the selected native view', async () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'overleaf-rpc-comments-')));
+    const sourceRoot = path.join(root, 'source'); fs.mkdirSync(sourceRoot);
+    const base = 'é😀 abc', document = 'comment-doc';
+    const doc = getOrCreateDoc(document, [base]);
+    let session;
+    try {
+      session = (await bridge.request('syncOpen', { root: path.join(root, 'state'), sourceRoot,
+        server: `http://127.0.0.1:${port}`, projectId: 'test_project' })).session;
+      await bridge.request('syncDocument', { session, document, action: 'open', path: 'main.tex', initial: { content: base, version: doc.version } });
+      await bridge.request('syncConnect', { session, document });
+      const result = await bridge.request('syncComment', { session, document, cookie: 'mock', csrfToken: 'mock',
+        selection: { thread: 'thread-native', message: 'Please revise', view: 'UNSAVED ' + base,
+          start: { row: 0, col: 15 }, end: { row: 0, col: 18 } } });
+      assertEqual(result.status, 'queued');
+      let state;
+      for (let count = 0; count < 100; count++) {
+        state = (await bridge.request('syncDocument', { session, document, action: 'snapshot' })).result;
+        if (state.comments.length === 0) break;
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      assertEqual(state.comments.length, 0);
+      assertEqual(state.remote.comments[0].op.p, 4);
+      assertEqual(doc.content, base);
+      assertEqual(fs.readFileSync(path.join(sourceRoot, 'main.tex'), 'utf8'), base);
+      let failure;
+      try { await bridge.request('syncComment', { session, document, cookie: 'mock', csrfToken: 'mock',
+        selection: { thread: 'thread-lost', message: 'LOSE COMMENT RESPONSE', view: base,
+          start: { row: 0, col: 7 }, end: { row: 0, col: 10 } } }); } catch (error) { failure = error; }
+      assertEqual(failure.code, 'COMMENT_UNCERTAIN');
+      state = (await bridge.request('syncDocument', { session, document, action: 'snapshot' })).result;
+      assertEqual(state.comments.length, 1);
+      assertEqual(state.comments[0].posted, false);
+      const inspected = await bridge.request('syncComment', { session, document, action: 'inspect',
+        token: state.comments[0].token, cookie: 'mock', csrfToken: 'mock' });
+      assertEqual(inspected.status, 'queued');
+    } finally {
+      if (session) await bridge.request('syncClose', { session });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  for (const format of [{ fileformat: 'unix', bomb: false }, { fileformat: 'dos', bomb: true }]) {
+  await test(`guarded ${format.fileformat} workspace saves reach the server through confirmed transport and reject legacy writes`, async () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'overleaf-rpc-transport-')));
+    const sourceRoot = path.join(root, 'source');
+    fs.mkdirSync(sourceRoot);
+    const base = 'intro\nseparator\nending';
+    const saved = 'SAVED é日本\nseparator\nending';
+    const physical = (format.bomb ? '\ufeff' : '') + saved.replaceAll('\n', format.fileformat === 'dos' ? '\r\n' : '\n');
+    const documentId = 'durable-wire-doc-' + format.fileformat;
+    fs.writeFileSync(path.join(sourceRoot, 'main.tex'), base);
+    const doc = getOrCreateDoc(documentId, base.split('\n'));
+    let session;
+    try {
+      session = (await bridge.request('syncOpen', { root: path.join(root, 'state'), sourceRoot,
+        server: `http://127.0.0.1:${port}`, projectId: 'test_project' })).session;
+      const opened = await bridge.request('syncDocument', { session, document: documentId,
+        action: 'open', path: 'main.tex', initial: { content: base, version: doc.version } });
+      const document = opened.document;
+      const cp = (text, format = {}) => ({ history: { current: 0, preferred: 0, nodes: [{ seq: 0, parent: null, content: text, empty: false }] },
+        tree: { seq_cur: 0, seq_last: 0 }, undo: null,
+        options: { fileformat: 'unix', fileencoding: '', binary: false, bomb: false, endofline: false, fixendofline: false, undolevels: 1000, ...format } });
+      await bridge.request('syncDocument', { session, document, action: 'checkpoint', revision: opened.revision, checkpoint: cp(base) });
+      await bridge.request('syncConnect', { session, document });
+      let rejected = false;
+      try { await bridge.request('applyOtUpdate', { docId: document, op: [{ p: 0, i: 'legacy' }], v: doc.version, content: base }); }
+      catch (error) { rejected = true; assertEqual(error.code, 'DOCUMENT_OWNED'); }
+      assert(rejected, 'legacy writes cannot share an acknowledgement stream');
+      const before = await bridge.request('syncDocument', { session, document, action: 'state' });
+      await bridge.request('syncDocument', { session, document, action: 'write', revision: before.revision, expected: base, checkpoint: cp(saved, format), undo: null });
+      let state;
+      for (let count = 0; count < 100; count++) {
+        state = await bridge.request('syncDocument', { session, document, action: 'snapshot' });
+        if (!state.result.pending && state.result.remote.wire === saved) break;
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      assertEqual(state.result.remote.content, physical);
+      assertEqual(state.result.remote.wire, saved);
+      assertEqual(state.result.pending, null);
+      assertEqual(fs.readFileSync(path.join(sourceRoot, 'main.tex'), 'utf8'), physical);
+      assertEqual(doc.lines.join('\n'), saved);
+    } finally {
+      if (session) await bridge.request('syncClose', { session });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+  }
+
+  await test('unknown upload review inspects a drained server queue and never replays the old submission', async () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'overleaf-rpc-uncertain-')));
+    const sourceRoot = path.join(root, 'source'); fs.mkdirSync(sourceRoot);
+    const document = 'uncertain-review-doc', base = 'base', saved = 'saved base';
+    const doc = getOrCreateDoc(document, [base]);
+    doc.holdApplied = true; doc.typedJoin = true;
+    const checkpoint = content => ({ history: { current: 0, preferred: 0, nodes: [{ seq: 0, parent: null, content, empty: false }] },
+      tree: { seq_cur: 0, seq_last: 0 }, undo: null,
+      options: { fileformat: 'unix', fileencoding: '', binary: false, bomb: false, endofline: false, fixendofline: false, undolevels: 1000 } });
+    let session;
+    try {
+      session = (await bridge.request('syncOpen', { root: path.join(root, 'state'), sourceRoot,
+        server: `http://127.0.0.1:${port}`, projectId: 'test_project' })).session;
+      const initial = await bridge.request('syncDocument', { session, document, action: 'open', path: 'main.tex', initial: { content: base, version: doc.version } });
+      await bridge.request('syncDocument', { session, document, action: 'checkpoint', revision: initial.revision, checkpoint: checkpoint(base) });
+      await bridge.request('syncConnect', { session, document });
+      let state = await bridge.request('syncDocument', { session, document, action: 'state' });
+      await bridge.request('syncDocument', { session, document, action: 'write', revision: state.revision, expected: base, checkpoint: checkpoint(saved) });
+      let pending;
+      for (let count = 0; count < 100; count++) {
+        pending = (await bridge.request('syncDocument', { session, document, action: 'snapshot' })).result.pending;
+        if (pending?.queued) break;
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      assert(pending?.queued, 'original queue receipt is durable');
+      const review = await bridge.request('syncUploadReview', { session, document });
+      assertEqual(review.canRetire, true);
+      assertEqual(review.pending.token, pending.token);
+      const accepted = await bridge.request('syncUploadReview', { session, document, accept: true, review });
+      assertEqual(accepted.status, 'review-required');
+      const result = (await bridge.request('syncDocument', { session, document, action: 'snapshot' })).result;
+      assertEqual(result.pending, null);
+      assertEqual(result.conflict.reason, 'reviewed-uncertainty');
+      assertEqual(result.recovery.uploadDecision.pending.token, pending.token);
+      assertEqual(doc.content, saved);
+      assertEqual(doc.version, 1, 'no repeat operation was published');
+    } finally {
+      doc.holdApplied = false;
+      if (session) await bridge.request('syncClose', { session });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  await test('an unprovable upload can be kept local without claiming its remote outcome or losing its intent', async () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'overleaf-rpc-local-')));
+    const sourceRoot = path.join(root, 'source'); fs.mkdirSync(sourceRoot);
+    const document = 'uncertain-local-doc', base = 'base', saved = 'saved base';
+    const doc = getOrCreateDoc(document, [base]); doc.holdApplied = true;
+    const checkpoint = content => ({ history: { current: 0, preferred: 0, nodes: [{ seq: 0, parent: null, content, empty: false }] },
+      tree: { seq_cur: 0, seq_last: 0 }, undo: null,
+      options: { fileformat: 'unix', fileencoding: '', binary: false, bomb: false, endofline: false, fixendofline: false, undolevels: 1000 } });
+    let session;
+    try {
+      session = (await bridge.request('syncOpen', { root: path.join(root, 'state'), sourceRoot,
+        server: `http://127.0.0.1:${port}`, projectId: 'test_project' })).session;
+      const initial = await bridge.request('syncDocument', { session, document, action: 'open', path: 'main.tex', initial: { content: base, version: 0 } });
+      await bridge.request('syncDocument', { session, document, action: 'checkpoint', revision: initial.revision, checkpoint: checkpoint(base) });
+      await bridge.request('syncConnect', { session, document });
+      const state = await bridge.request('syncDocument', { session, document, action: 'state' });
+      await bridge.request('syncDocument', { session, document, action: 'write', revision: state.revision, expected: base, checkpoint: checkpoint(saved) });
+      for (let count = 0; count < 100 && !doc.releaseApplied; count++) await new Promise(resolve => setTimeout(resolve, 10));
+      assert(doc.releaseApplied, 'submission reached server');
+      const review = await bridge.request('syncUploadReview', { session, document });
+      assertEqual(review.canRetire, false);
+      const retained = await bridge.request('syncDocument', { session, document, action: 'keepUncertainLocal', review,
+        checkpoint: checkpoint('UNSAVED ' + saved) });
+      assertEqual(retained.state.publication, 'local-only');
+      const result = (await bridge.request('syncDocument', { session, document, action: 'snapshot' })).result;
+      assertEqual(result.buffer, 'UNSAVED ' + saved);
+      assertEqual(result.recovery.localOnly.pending.token, review.pending.token);
+      assertEqual(fs.readFileSync(path.join(sourceRoot, 'main.tex'), 'utf8'), saved);
+      assertEqual(doc.version, 1);
+    } finally {
+      doc.holdApplied = false;
+      if (session) await bridge.request('syncClose', { session });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  await test('remote compile RPC waits for an applied saved revision before invoking the compiler', async () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'overleaf-compile-gate-')));
+    const sourceRoot = path.join(root, 'sources');
+    fs.mkdirSync(sourceRoot);
+    const document = 'compile-gated-doc', base = 'base source', saved = 'saved source';
+    const doc = getOrCreateDoc(document, [base]);
+    doc.holdApplied = true;
+    let session;
+    try {
+      ({ session } = await bridge.request('syncOpen', { root: path.join(root, 'state'), sourceRoot,
+        server: `http://127.0.0.1:${port}`, projectId: 'test_project' }));
+      let state = await bridge.request('syncDocument', { session, document, action: 'open', path: 'main.tex',
+        initial: { content: base, version: doc.version } });
+      await bridge.request('syncProject', { session, project: { name: 'Paper', tree: [{ id: document, path: 'main.tex', type: 'doc' }] } });
+      const checkpoint = text => ({ history: { current: 0, preferred: 0, nodes: [{ seq: 0, parent: null, content: text, empty: false }] },
+        tree: { seq_cur: 0, seq_last: 0 }, undo: null,
+        options: { fileformat: 'unix', fileencoding: '', binary: false, bomb: false, endofline: false, fixendofline: false, undolevels: 1000 } });
+      await bridge.request('syncDocument', { session, document, action: 'checkpoint', revision: state.revision, checkpoint: checkpoint(base) });
+      await bridge.request('syncConnect', { session, document });
+      state = await bridge.request('syncDocument', { session, document, action: 'state' });
+      await bridge.request('syncDocument', { session, document, action: 'write', revision: state.revision, expected: base, checkpoint: checkpoint(saved) });
+      let completed = false;
+      const count = srv.compilations.length;
+      const compile = bridge.request('syncCompile', { session, cookie: 'mock_session=test', csrfToken: 'test', projectId: 'test_project' })
+        .then(value => ({ value }), error => ({ error })).then(result => { completed = true; return result; });
+      await new Promise(resolve => setTimeout(resolve, 150));
+      const premature = completed;
+      const invokedBeforeAck = srv.compilations.length;
+      assert(doc.releaseApplied, 'server has received the saved update');
+      doc.releaseApplied();
+      const result = await compile;
+      assertEqual(premature, false, 'compile waits for confirmed application');
+      assertEqual(invokedBeforeAck, count, 'compiler not invoked before proof');
+      assert(!result.error, JSON.stringify(result.error));
+      assertEqual(result.value.status, 'success', 'compile completed');
+      assertEqual(srv.compilations.length, count + 1, 'compiler invoked exactly once');
+    } finally {
+      doc.holdApplied = false;
+      if (session) await bridge.request('syncClose', { session });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   await test('compile does not duplicate zone when download domain includes zone', async () => {
@@ -383,6 +629,7 @@ async function runTests() {
 
   await test('downloadUrl follows redirects and returns a non-empty file', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'overleaf-test-'));
+    fs.writeFileSync(path.join(dir, 'overleaf_output.pdf'), 'previous complete PDF');
     const result = await bridge.request('downloadUrl', {
       cookie: 'mock_session=test',
       url: `http://127.0.0.1:${port}/download/redirect-pdf`,
@@ -416,6 +663,195 @@ async function runTests() {
   });
 
   // ── Test Suite: Document Operations ──────────────────────────────
+  await test('compile log downloads do not forward authentication to another origin', async () => {
+    const http = require('node:http');
+    let receivedCookie;
+    const external = http.createServer((req, res) => { receivedCookie = req.headers.cookie; res.end('external compile log'); });
+    await new Promise(resolve => external.listen(0, '127.0.0.1', resolve));
+    const primary = http.createServer((req, res) => {
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ status: 'success', outputFiles: [
+        { path: 'output.log', url: `http://127.0.0.1:${external.address().port}/output.log` },
+      ] }));
+    });
+    await new Promise(resolve => primary.listen(0, '127.0.0.1', resolve));
+    const client = new BridgeClient(primary.address().port);
+    try {
+      await client.start();
+      const result = await client.request('compile', { cookie: 'private-fixture-cookie', csrfToken: 'fixture', projectId: 'fixture' });
+      assertEqual(result.log, 'external compile log', 'cross-origin output remains readable');
+      assertEqual(receivedCookie, undefined, 'compile log receives no cookie');
+    } finally {
+      await client.stop();
+      await Promise.all([primary, external].map(server => new Promise(resolve => server.close(resolve))));
+    }
+  });
+
+  await test('download filenames cannot escape their output directory through either RPC', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'overleaf-download-path-'));
+    const outputDir = path.join(root, 'output');
+    fs.mkdirSync(outputDir);
+    fs.mkdirSync(path.join(outputDir, 'overleaf_nested'));
+    const protectedFile = path.join(root, 'protected.pdf');
+    fs.writeFileSync(protectedFile, 'keep this file');
+    try {
+      for (const method of ['downloadUrl', 'downloadFile']) {
+        for (const fileName of ['nested/../../protected.pdf', '../protected.pdf', '..\\protected.pdf', '/absolute.pdf', '.', '..', 'bad\0name', '']) {
+          let failure;
+          try {
+            await bridge.request(method, { cookie: 'mock_session=test', outputDir, fileName,
+              url: `http://127.0.0.1:${port}/download/pdf`, projectId: 'test_project', fileId: 'asset_binary' });
+          } catch (error) { failure = error; }
+          assertEqual(failure?.code, 'INVALID_FILENAME', `${method}: reject ${JSON.stringify(fileName)}`);
+          assertEqual(fs.readFileSync(protectedFile, 'utf8'), 'keep this file', 'outside source retained');
+        }
+      }
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  await test('downloadFile installs complete binary bytes and keeps its filename fallback bounded', async () => {
+    const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'overleaf-file-download-'));
+    try {
+      const result = await bridge.request('downloadFile', { cookie: 'mock_session=test', outputDir,
+        projectId: 'test_project', fileId: 'asset_binary' });
+      assertEqual(path.basename(result.path), 'overleaf_asset_binary', 'safe fallback name');
+      assertEqual(fs.readFileSync(result.path).toString('hex'), '00ff800a0d', 'exact binary response');
+      let failure;
+      try { await bridge.request('downloadFile', { cookie: 'mock_session=test', outputDir,
+        projectId: 'test_project', fileId: '../outside' }); } catch (error) { failure = error; }
+      assertEqual(failure?.code, 'INVALID_FILENAME', 'fallback IDs cannot introduce a path');
+    } finally { fs.rmSync(outputDir, { recursive: true, force: true }); }
+  });
+
+  await test('invalid redirects and oversized streams preserve the previous download', async () => {
+    const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'overleaf-download-bounds-'));
+    const destination = path.join(outputDir, 'overleaf_output.pdf');
+    const server = require('node:http').createServer((req, res) => {
+      if (req.url === '/large-header') { res.writeHead(200, { 'Content-Length': 65 * 1024 * 1024 }); res.end(); }
+      else if (req.url === '/large-stream') {
+        const chunk = Buffer.alloc(1024 * 1024);
+        let count = 0;
+        const write = () => {
+          while (!res.destroyed && count++ < 65) if (!res.write(chunk)) { res.once('drain', write); return; }
+          res.end();
+        };
+        write();
+      } else {
+        res.writeHead(302, { Location: req.url === '/loop' ? '/loop' : 'file:///unavailable' });
+        res.end();
+      }
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      for (const [endpoint, code] of [['/large-header', 'FILE_LIMIT'], ['/large-stream', 'FILE_LIMIT'],
+        ['/loop', 'TOO_MANY_REDIRECTS'], ['/invalid', 'DOWNLOAD_FAILED']]) {
+        fs.writeFileSync(destination, 'previous complete PDF');
+        let failure;
+        try { await bridge.request('downloadUrl', { cookie: 'fixture-cookie', outputDir, fileName: 'output.pdf',
+          url: `http://127.0.0.1:${server.address().port}${endpoint}` }); } catch (error) { failure = error; }
+        assertEqual(failure?.code, code, 'bounded download failure');
+        assertEqual(fs.readFileSync(destination, 'utf8'), 'previous complete PDF', 'old download retained');
+        assertEqual(fs.readdirSync(outputDir).join(','), 'overleaf_output.pdf', 'no partial stage remains');
+      }
+    } finally {
+      await new Promise(resolve => server.close(resolve));
+      fs.rmSync(outputDir, { recursive: true, force: true });
+    }
+  });
+
+  await test('failed downloads preserve an existing destination and remove private partial files', async () => {
+    const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'overleaf-download-failure-'));
+    const destination = path.join(outputDir, 'overleaf_output.pdf');
+    try {
+      for (const endpoint of ['/missing-download', '/download/empty', '/project/test_project/file/asset_truncated']) {
+        fs.writeFileSync(destination, 'previous complete PDF');
+        let failure;
+        try { await bridge.request('downloadUrl', { cookie: 'mock_session=test', outputDir,
+          fileName: 'output.pdf', url: `http://127.0.0.1:${port}${endpoint}` }); }
+        catch (error) { failure = error; }
+        assert(failure, 'incomplete response must fail');
+        assertEqual(fs.readFileSync(destination, 'utf8'), 'previous complete PDF', 'failed download retained previous file');
+        assertEqual(fs.readdirSync(outputDir).join(','), 'overleaf_output.pdf', 'no partial download remains');
+      }
+    } finally { fs.rmSync(outputDir, { recursive: true, force: true }); }
+  });
+
+  await test('downloads reject symlink and hard-link destinations without altering either file', async () => {
+    const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'overleaf-download-links-'));
+    const source = path.join(outputDir, 'keep.pdf'), destination = path.join(outputDir, 'overleaf_output.pdf');
+    fs.writeFileSync(source, 'protected contents');
+    try {
+      for (const link of [() => fs.symlinkSync(source, destination), () => fs.linkSync(source, destination)]) {
+        link();
+        let failure;
+        try { await bridge.request('downloadUrl', { cookie: 'mock_session=test', outputDir,
+          fileName: 'output.pdf', url: `http://127.0.0.1:${port}/download/pdf` }); }
+        catch (error) { failure = error; }
+        assertEqual(failure?.code, 'UNSAFE_DOWNLOAD', 'linked destination rejected');
+        assertEqual(fs.readFileSync(source, 'utf8'), 'protected contents', 'link target retained');
+        assertEqual(fs.readFileSync(destination, 'utf8'), 'protected contents', 'destination retained');
+        fs.unlinkSync(destination);
+      }
+    } finally { fs.rmSync(outputDir, { recursive: true, force: true }); }
+  });
+
+  await test('a destination changed during download is retained and cross-origin cookies are absent', async () => {
+    const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'overleaf-download-race-'));
+    const destination = path.join(outputDir, 'overleaf_output.pdf');
+    fs.writeFileSync(destination, 'previous PDF');
+    let receivedCookie;
+    const server = require('node:http').createServer((req, res) => {
+      receivedCookie = req.headers.cookie;
+      fs.writeFileSync(destination, 'new external edit');
+      res.end('complete downloaded PDF');
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      let failure;
+      try { await bridge.request('downloadUrl', { cookie: 'mock_session=test', outputDir,
+        fileName: 'output.pdf', url: `http://127.0.0.1:${server.address().port}/pdf` }); }
+      catch (error) { failure = error; }
+      assertEqual(failure?.code, 'DOWNLOAD_CHANGED', 'intervening destination edit rejected');
+      assertEqual(fs.readFileSync(destination, 'utf8'), 'new external edit', 'external edit retained');
+      assertEqual(receivedCookie, undefined, 'cookie restricted to configured origin');
+      assertEqual(fs.readdirSync(outputDir).join(','), 'overleaf_output.pdf', 'private stage removed');
+    } finally {
+      await new Promise(resolve => server.close(resolve));
+      fs.rmSync(outputDir, { recursive: true, force: true });
+    }
+  });
+
+  await test('workspace asset fetch preserves exact bytes, empty files, and independent local versions', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'overleaf-assets-rpc-'));
+    const sourceRoot = path.join(root, 'sources');
+    fs.mkdirSync(sourceRoot);
+    let session;
+    try {
+      ({ session } = await bridge.request('syncOpen', { root: path.join(root, 'state'), sourceRoot,
+        server: `http://127.0.0.1:${port}`, projectId: 'test_project' }));
+      for (const document of ['asset_binary', 'asset_redirect', 'asset_empty']) {
+        const reply = await bridge.request('syncFetchAsset', { session, document, path: `${document}.bin`, cookie: 'mock_session=test' });
+        assertEqual(reply.state.status, 'synced');
+        assertEqual(fs.readFileSync(path.join(sourceRoot, `${document}.bin`)).toString('hex'),
+          document === 'asset_empty' ? '' : '00ff800a0d');
+      }
+      fs.writeFileSync(path.join(sourceRoot, 'asset_binary.bin'), 'local edit');
+      const saved = await bridge.request('syncFetchAsset', { session, document: 'asset_binary', path: 'asset_binary.bin', cookie: 'mock_session=test' });
+      assertEqual(saved.state.status, 'local-changes');
+      assertEqual(fs.readFileSync(path.join(sourceRoot, 'asset_binary.bin'), 'utf8'), 'local edit');
+      for (const document of ['asset_large', 'asset_truncated']) {
+        let rejected;
+        try { await bridge.request('syncFetchAsset', { session, document, path: `${document}.bin`, cookie: 'mock_session=test' }); }
+        catch (error) { rejected = error; }
+        assertEqual(rejected?.code, document === 'asset_large' ? 'FILE_LIMIT' : 'DOWNLOAD_FAILED');
+        assert(!fs.existsSync(path.join(sourceRoot, `${document}.bin`)), 'incomplete asset must not be installed');
+      }
+    } finally {
+      if (session) await bridge.request('syncClose', { session });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   console.log('\nDocument Operations:');
 
   // Pre-create doc in mock server

@@ -116,3 +116,26 @@ vim.cmd('qa!')
     assert.deepEqual(encodeEditor(state, { forWrite: true }), await fs.readFile(path.join(directory, String(index + 1))), JSON.stringify(state));
   }
 });
+
+test('logical wire text maps reversibly to explicit local BOM and line endings without inventing a final newline', () => {
+  const { toWire, fromWire } = require('../../../node/sync/codec');
+  for (const fileformat of ['unix', 'dos']) for (const bomb of [false, true]) {
+    const format = { fileformat, bomb };
+    for (const logical of ['', '\n', 'é😀\nlast', 'é😀\nlast\n', '\ufeffliteral']) {
+      const physical = fromWire(logical, format);
+      assert.equal(physical, (bomb ? '\ufeff' : '') + logical.replaceAll('\n', fileformat === 'dos' ? '\r\n' : '\n'));
+      assert.equal(toWire(physical, format), logical);
+    }
+  }
+});
+
+test('wire conversion refuses mixed separators, literal CR, missing declared BOM, and unsupported formats', () => {
+  const { toWire, fromWire } = require('../../../node/sync/codec');
+  for (const [text, format] of [
+    ['one\r\ntwo\n', { fileformat: 'dos', bomb: false }],
+    ['one\rtwo', { fileformat: 'unix', bomb: false }],
+    ['missing marker', { fileformat: 'unix', bomb: true }],
+    ['text', { fileformat: 'mac', bomb: false }],
+  ]) assert.throws(() => toWire(text, format), { code: 'UNSUPPORTED_TEXT' });
+  assert.throws(() => fromWire('server\rtext', { fileformat: 'unix', bomb: false }), { code: 'UNSUPPORTED_TEXT' });
+});

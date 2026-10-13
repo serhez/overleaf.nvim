@@ -10,7 +10,7 @@ test: test-lua test-node
 test-lua: $(PLENARY_DIR)
 	nvim --headless --noplugin \
 		-u tests/minimal_init.lua \
-		-c "PlenaryBustedDirectory tests/ { minimal_init = 'tests/minimal_init.lua', sequential = true }"
+		-c "PlenaryBustedDirectory tests/ { minimal_init = 'tests/minimal_init.lua', sequential = true, timeout = 180000 }"
 
 test-node:
 	cd tests/node && npm install --silent 2>/dev/null

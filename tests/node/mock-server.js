@@ -168,7 +168,7 @@ class MockClient {
 
     if (ackId) {
       // [error, lines, version, updates, ranges]
-      this.sendAck(ackId, null, encodedLines, doc.version, [], {});
+      this.sendAck(ackId, null, encodedLines, doc.version, [], {}, doc.typedJoin ? 'sharejs-text-ot' : undefined);
     }
   }
 
@@ -204,6 +204,9 @@ class MockClient {
 
     // Apply ops to document content
     const ops = update.op || [];
+    // Independent legacy protocol fixture: UpdateManager._sanitizeUpdate
+    // replaces surrogate code units even when they form a valid pair.
+    for (const op of ops) if (typeof op.i === 'string') op.i = op.i.replace(/[\uD800-\uDFFF]/g, '\uFFFD');
     let newContent;
     try {
       newContent = applyOps(doc.content, ops);
@@ -233,7 +236,9 @@ class MockClient {
     doc.version++;
 
     // ACK to sender (no op field = own ACK)
-    this.sendEvent('otUpdateApplied', { doc: docId, v: doc.version });
+    const applied = () => this.sendEvent('otUpdateApplied', { doc: docId, v: update.v });
+    if (doc.holdApplied) doc.releaseApplied = applied;
+    else applied();
 
     // Broadcast to other clients (with op field = remote update)
     for (const client of doc.clients) {
@@ -265,8 +270,29 @@ let sessionCounter = 0;
 const sessions = {};
 
 function createServer(port) {
+  const compilations = [];
+  const commentPosts = [];
+  const threads = {};
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, `http://localhost:${port}`);
+
+    if (url.pathname === '/project/test_project/threads' && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(threads)); return;
+    }
+    const comment = url.pathname.match(/^\/project\/test_project\/thread\/([^/]+)\/messages$/);
+    if (comment && req.method === 'POST') {
+      let body = '';
+      req.on('data', chunk => { body += chunk; });
+      req.on('end', () => {
+        const message = JSON.parse(body);
+        commentPosts.push({ thread: comment[1], ...message });
+        (threads[comment[1]] ??= { messages: [] }).messages.push(message);
+        if (message.content === 'LOSE COMMENT RESPONSE') { res.destroy(); return; }
+        res.writeHead(201, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(message));
+      });
+      return;
+    }
 
     // Socket.IO v0.9 handshake: GET /socket.io/1/?...
     if (url.pathname === '/socket.io/1/' || url.pathname === '/socket.io/1') {
@@ -281,6 +307,7 @@ function createServer(port) {
     }
 
     if (url.pathname.match(/^\/project\/test_project(_domain_zone|_path_zone)?\/compile$/) && req.method === 'POST') {
+      compilations.push({ projectId: url.pathname.split('/')[2] });
       const origin = `http://${req.headers.host}`;
       const projectId = url.pathname.split('/')[2];
       const hasDomainZone = projectId === 'test_project_domain_zone';
@@ -356,6 +383,25 @@ function createServer(port) {
       return;
     }
 
+    const asset = url.pathname.match(/^\/project\/test_project\/file\/(asset_[a-z]+)$/)?.[1];
+    if (asset) {
+      if (asset === 'asset_truncated') {
+        res.writeHead(200, { 'Content-Length': 100 });
+        res.end('partial');
+      } else if (asset === 'asset_large') {
+        res.writeHead(200, { 'Content-Length': 17 * 1024 * 1024 });
+        res.end(Buffer.alloc(17 * 1024 * 1024));
+      } else if (asset === 'asset_redirect') {
+        res.writeHead(302, { Location: '/project/test_project/file/asset_binary' });
+        res.end();
+      } else {
+        const body = asset === 'asset_empty' ? Buffer.alloc(0) : Buffer.from([0, 255, 128, 10, 13]);
+        res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': body.length });
+        res.end(body);
+      }
+      return;
+    }
+
     res.writeHead(404);
     res.end('Not found');
   });
@@ -425,6 +471,9 @@ function createServer(port) {
       console.log(`[mock-server] Listening on http://127.0.0.1:${port}`);
       resolve({
         server,
+        compilations,
+        commentPosts,
+        threads,
         port,
         resetDocs,
         getDocs: () => docs,
