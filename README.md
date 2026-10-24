@@ -935,10 +935,33 @@ captures. Persistence failures pause imports and retain those captures; obsolete
 session/document replies cannot change the buffer. Workspace saves require the
 local bridge, but do not require an Overleaf network connection.
 
+An unexpected disconnect retries with exponential backoff, up to five attempts.
+Returning focus to Neovim or resuming a suspended editor retries an offline project
+after that batch is exhausted. Manual disconnection remains offline.
+
+Authentication and API HTTP responses are limited to 16 MiB. GET and DELETE
+requests have a 15-second total deadline, JSON POST requests 30 seconds, and
+multipart uploads 60 seconds. These deadlines include connection and response
+transfer time; a peer sending occasional data cannot extend them. Interrupted
+responses fail with `RESPONSE_INTERRUPTED`, oversized responses with
+`RESPONSE_TOO_LARGE`, and expired deadlines with `REQUEST_TIMEOUT`.
+Socket handshakes use the same response bounds and are cancelled on disconnect.
+The internal `httpGet(url, cookie, { headers, signal })` helper accepts explicit
+handshake headers and an `AbortSignal` without changing the ordinary GET defaults.
+
+Synchronization notifications are hints to reread durable document state. When
+Neovim stops consuming bridge output, repeated hints retain only the latest value
+per session and document. RPC replies and ordered remote operations are preserved.
+
 Normal bridge shutdown closes stdin and drains accepted synchronization requests
 and recovery writes before reporting the process stopped. Unresponsive network
 requests can be abandoned after five seconds; this deadline does not interrupt
 recovery writes. New requests and starts receive `STOPPING` while it drains.
+Comment posts and upload reviews can abandon their network wait while their
+already accepted local work finishes. Unconfirmed comments retain their durable
+drafts for explicit inspection; shutdown never repeats an uncertain post. The
+process remains alive until recovery stores close, even if an unresolved network
+request has no open socket.
 On final Neovim exit, `VimLeavePre` closes bridge input and waits for the bridge
 to finish accepted work and close its recovery stores. Slow storage can delay
 exit; a waiting message appears instead of terminating an unfinished write.

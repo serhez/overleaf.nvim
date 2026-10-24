@@ -6,36 +6,69 @@ const cheerio = require('cheerio');
 
 const BASE_URL = process.env.OVERLEAF_URL || 'https://www.overleaf.com';
 
-function httpGet(url, cookie) {
+const RESPONSE_LIMIT = 16 * 1024 * 1024;
+const failure = (code, message) => Object.assign(new Error(message), { code });
+
+function httpRequest(url, cookie, { method = 'GET', timeout = 15000, csrfToken, body, contentType, extraHeaders, signal } = {}) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
-    const httpModule = parsed.protocol === 'http:' ? http : https;
-    const options = {
+    const headers = {
+      Cookie: cookie,
+      'User-Agent': 'overleaf-neovim/0.1',
+      Accept: method === 'GET' ? 'text/html,application/xhtml+xml' : 'application/json',
+      ...extraHeaders,
+    };
+    if (csrfToken !== undefined) headers['X-Csrf-Token'] = csrfToken;
+    if (body !== undefined) {
+      headers['Content-Type'] = contentType;
+      headers['Content-Length'] = Buffer.byteLength(body);
+    }
+    let timer, settled = false;
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) { req.destroy(); reject(error); }
+      else resolve(result);
+    };
+    const interrupted = () => finish(failure('RESPONSE_INTERRUPTED', 'HTTP response was interrupted'));
+    const req = (parsed.protocol === 'http:' ? http : https).request({
       hostname: parsed.hostname,
       port: parsed.port || (parsed.protocol === 'http:' ? 80 : 443),
       path: parsed.pathname + parsed.search,
-      method: 'GET',
-      headers: {
-        'Cookie': cookie,
-        'User-Agent': 'overleaf-neovim/0.1',
-        'Accept': 'text/html,application/xhtml+xml',
-      },
-    };
-
-    const req = httpModule.request(options, (res) => {
-      let body = '';
-      res.on('data', (chunk) => { body += chunk; });
-      res.on('end', () => {
-        resolve({ status: res.statusCode, headers: res.headers, body });
+      method,
+      headers,
+      signal,
+    }, res => {
+      res.once('error', interrupted);
+      res.once('close', () => { if (!res.complete) interrupted(); });
+      if (Number(res.headers['content-length']) > RESPONSE_LIMIT) {
+        finish(failure('RESPONSE_TOO_LARGE', 'HTTP response exceeds 16 MiB'));
+        return;
+      }
+      const chunks = [];
+      let bytes = 0;
+      res.on('data', chunk => {
+        if (settled) return;
+        bytes += chunk.length;
+        if (bytes > RESPONSE_LIMIT) finish(failure('RESPONSE_TOO_LARGE', 'HTTP response exceeds 16 MiB'));
+        else chunks.push(chunk);
+      });
+      res.once('end', () => {
+        if (!res.complete) { interrupted(); return; }
+        if (!settled) finish(null, { status: res.statusCode, headers: res.headers,
+          body: Buffer.concat(chunks, bytes).toString('utf8') });
       });
     });
-
-    req.on('error', reject);
-    req.setTimeout(15000, () => {
-      req.destroy(new Error('Request timeout'));
-    });
-    req.end();
+    req.once('error', error => finish(error));
+    // Bound the entire response, including peers that continuously trickle data.
+    timer = setTimeout(() => finish(failure('REQUEST_TIMEOUT', 'HTTP request timed out')), timeout);
+    req.end(body);
   });
+}
+
+function httpGet(url, cookie, options) {
+  return httpRequest(url, cookie, { extraHeaders: options?.headers, signal: options?.signal });
 }
 
 async function fetchProjectPage(cookie) {
@@ -122,126 +155,34 @@ async function updateCookies(cookie) {
   return cookie;
 }
 
-function httpPost(url, cookie, csrfToken, body) {
-  return new Promise((resolve, reject) => {
-    const parsed = new URL(url);
-    const httpModule = parsed.protocol === 'http:' ? http : https;
-    const data = JSON.stringify(body);
-    const options = {
-      hostname: parsed.hostname,
-      port: parsed.port || (parsed.protocol === 'http:' ? 80 : 443),
-      path: parsed.pathname + parsed.search,
-      method: 'POST',
-      headers: {
-        'Cookie': cookie,
-        'X-Csrf-Token': csrfToken,
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(data),
-        'User-Agent': 'overleaf-neovim/0.1',
-        'Accept': 'application/json',
-      },
-    };
-
-    const req = httpModule.request(options, (res) => {
-      let responseBody = '';
-      res.on('data', (chunk) => { responseBody += chunk; });
-      res.on('end', () => {
-        resolve({ status: res.statusCode, headers: res.headers, body: responseBody });
-      });
-    });
-
-    req.on('error', reject);
-    req.setTimeout(30000, () => {
-      req.destroy(new Error('Request timeout'));
-    });
-    req.write(data);
-    req.end();
-  });
+async function httpPost(url, cookie, csrfToken, body) {
+  return httpRequest(url, cookie, { method: 'POST', timeout: 30000, csrfToken,
+    body: JSON.stringify(body), contentType: 'application/json' });
 }
 
 function httpDelete(url, cookie, csrfToken) {
-  return new Promise((resolve, reject) => {
-    const parsed = new URL(url);
-    const httpModule = parsed.protocol === 'http:' ? http : https;
-    const options = {
-      hostname: parsed.hostname,
-      port: parsed.port || (parsed.protocol === 'http:' ? 80 : 443),
-      path: parsed.pathname + parsed.search,
-      method: 'DELETE',
-      headers: {
-        'Cookie': cookie,
-        'X-Csrf-Token': csrfToken,
-        'User-Agent': 'overleaf-neovim/0.1',
-        'Accept': 'application/json',
-      },
-    };
-
-    const req = httpModule.request(options, (res) => {
-      let body = '';
-      res.on('data', (chunk) => { body += chunk; });
-      res.on('end', () => {
-        resolve({ status: res.statusCode, headers: res.headers, body });
-      });
-    });
-
-    req.on('error', reject);
-    req.setTimeout(15000, () => {
-      req.destroy(new Error('Request timeout'));
-    });
-    req.end();
-  });
+  return httpRequest(url, cookie, { method: 'DELETE', csrfToken });
 }
 
-function httpPostMultipart(url, cookie, csrfToken, filePath, fileName) {
-  return new Promise((resolve, reject) => {
-    const fs = require('fs');
-    const path = require('path');
-    const parsed = new URL(url);
-    const httpModule = parsed.protocol === 'http:' ? http : https;
-    const boundary = '----OverleafNeovim' + Date.now().toString(36);
-    fileName = fileName || path.basename(filePath);
+async function httpPostMultipart(url, cookie, csrfToken, filePath, fileName) {
+  const fs = require('fs');
+  const path = require('path');
+  const boundary = '----OverleafNeovim' + Date.now().toString(36);
+  fileName = fileName || path.basename(filePath);
 
-    const fileData = fs.readFileSync(filePath);
+  const fileData = fs.readFileSync(filePath);
 
-    // Build multipart body
-    const parts = [];
-    parts.push(`--${boundary}\r\n`);
-    parts.push(`Content-Disposition: form-data; name="qqfile"; filename="${fileName}"\r\n`);
-    parts.push(`Content-Type: application/octet-stream\r\n\r\n`);
-    const header = Buffer.from(parts.join(''));
-    const footer = Buffer.from(`\r\n--${boundary}--\r\n`);
-    const body = Buffer.concat([header, fileData, footer]);
+  // Build multipart body
+  const parts = [];
+  parts.push(`--${boundary}\r\n`);
+  parts.push(`Content-Disposition: form-data; name="qqfile"; filename="${fileName}"\r\n`);
+  parts.push(`Content-Type: application/octet-stream\r\n\r\n`);
+  const header = Buffer.from(parts.join(''));
+  const footer = Buffer.from(`\r\n--${boundary}--\r\n`);
+  const body = Buffer.concat([header, fileData, footer]);
 
-    const options = {
-      hostname: parsed.hostname,
-      port: parsed.port || (parsed.protocol === 'http:' ? 80 : 443),
-      path: parsed.pathname + parsed.search,
-      method: 'POST',
-      headers: {
-        'Cookie': cookie,
-        'X-Csrf-Token': csrfToken,
-        'Content-Type': `multipart/form-data; boundary=${boundary}`,
-        'Content-Length': body.length,
-        'User-Agent': 'overleaf-neovim/0.1',
-        'Accept': 'application/json',
-      },
-    };
-
-    const req = httpModule.request(options, (res) => {
-      let responseBody = '';
-      res.on('data', (chunk) => { responseBody += chunk; });
-      res.on('end', () => {
-        resolve({ status: res.statusCode, headers: res.headers, body: responseBody });
-      });
-    });
-
-    req.on('error', reject);
-    req.setTimeout(60000, () => {
-      req.destroy(new Error('Upload timeout'));
-    });
-    req.write(body);
-    req.end();
-  });
+  return httpRequest(url, cookie, { method: 'POST', timeout: 60000, csrfToken,
+    body, contentType: `multipart/form-data; boundary=${boundary}` });
 }
 
 module.exports = { fetchProjectPage, updateCookies, httpPost, httpGet, httpDelete, httpPostMultipart };

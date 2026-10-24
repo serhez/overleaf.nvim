@@ -11,6 +11,7 @@ const SocketManager = require('./socket');
 const { rebaseHistory } = require('./sync/history');
 const { SyncSession } = require('./sync/session');
 const { getOverleafCookie, listProfiles } = require('./browser-cookie');
+const { createOutput } = require('./bridge-output');
 
 // Redirect console.log to stderr (stdout is the RPC channel)
 const origLog = console.log;
@@ -28,7 +29,9 @@ let stdinClosed = false;
 let exiting = false;
 let abandonNetwork = false;
 const syncSessions = new Map();
-const syncMethods = new Set(['syncOpen', 'syncProject', 'syncDocument', 'syncAsset', 'syncAssetLifecycle', 'syncCaptureBuild', 'syncFinishBuild', 'syncComment', 'syncMergeView', 'syncUploadReview', 'syncClose', 'syncInspectLocks', 'syncRecoverLocks']);
+// Composite network handlers drain their accepted local work through session.close;
+// their HTTP responses and document joins must not hold this persistence barrier.
+const syncMethods = new Set(['syncOpen', 'syncProject', 'syncDocument', 'syncAsset', 'syncAssetLifecycle', 'syncCaptureBuild', 'syncFinishBuild', 'syncMergeView', 'syncClose', 'syncInspectLocks', 'syncRecoverLocks']);
 
 function syncSession(id) {
   const session = syncSessions.get(id);
@@ -36,9 +39,7 @@ function syncSession(id) {
   return session;
 }
 
-function send(obj) {
-  process.stdout.write(JSON.stringify(obj) + '\n');
-}
+const { send, sendEvent } = createOutput(process.stdout);
 
 function sendResult(id, result) {
   send({ id, result });
@@ -46,10 +47,6 @@ function sendResult(id, result) {
 
 function sendError(id, code, message) {
   send({ id, error: { code, message } });
-}
-
-function sendEvent(event, data) {
-  send({ event, data });
 }
 
 function headersForUrl(parsed, cookie) {
@@ -320,6 +317,7 @@ const handlers = {
     if (params.action !== undefined && params.action !== 'create') throw { code: 'UNKNOWN_ACTION', message: 'Unknown comment action' };
     const reply = await session.document({ document: params.document, action: 'stageComment', selection: params.selection });
     const draft = reply.result;
+    if (abandonNetwork || session._closing) throw bridgeError('STOPPING', 'Comment draft retained locally during shutdown');
     const url = `${session.server}/project/${encodeURIComponent(session.projectId)}/thread/${encodeURIComponent(draft.thread)}/messages`;
     try {
       const response = await auth.httpPost(url, params.cookie, params.csrfToken, { content: draft.message });
@@ -786,9 +784,10 @@ rl.on('close', () => {
     socketManager = null;
   }
   maybeExit();
-  // A stalled network request must not prevent shutdown indefinitely, but this
-  // deadline never interrupts an accepted recovery operation or store close.
-  setTimeout(() => { abandonNetwork = true; maybeExit(); }, 5000).unref();
+  // Keep the process alive until its stores close, even if an unresolved request
+  // has no IO handle. Network waits can be abandoned after five seconds; accepted
+  // recovery operations and store closure must keep draining beyond that point.
+  setInterval(() => { abandonNetwork = true; maybeExit(); }, 5000);
   // Clean EOF drains accepted persistence work. SIGTERM/SIGKILL remain abrupt
   // exits and deliberately leave writer locks for explicit recovery.
 });

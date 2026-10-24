@@ -3,6 +3,7 @@
 const crypto = require('crypto');
 const { EventEmitter } = require('node:events');
 const { validateText } = require('./sync/merge');
+const { httpGet } = require('./auth');
 const failure = (code, message) => Object.assign(new Error(message), { code });
 const wireDecoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 
@@ -37,30 +38,13 @@ function decodeWireText(value) {
     ].join('/');
     const queryStr = options.query || '';
     const fullUrl = queryStr ? handshakeUrl + '&' + queryStr : handshakeUrl;
-    const parsed = new (require('url').URL)(fullUrl);
-
-    const httpModule = parsed.protocol === 'http:' ? require('http') : require('https');
-    const req = httpModule.request({
-      hostname: parsed.hostname,
-      port: parsed.port || (parsed.protocol === 'http:' ? 80 : 443),
-      path: parsed.pathname + parsed.search,
-      method: 'GET',
-      headers: Object.assign({}, extraHeaders),
-    }, (res) => {
-      let body = '';
-      res.on('data', (chunk) => { body += chunk; });
-      res.on('end', () => {
-        if (res.statusCode === 200) {
-          fn.apply(null, body.split(':'));
-        } else {
-          self.connecting = false;
-          self.onError(new Error('Handshake failed: ' + res.statusCode));
-        }
-      });
-    });
-    req.on('error', (err) => { self.connecting = false; self.onError(err); });
-    req.setTimeout(15000, () => req.destroy(new Error('Handshake timeout')));
-    req.end();
+    httpGet(fullUrl, extraHeaders.Cookie, { headers: extraHeaders, signal: options.handshakeSignal }).then(res => {
+      if (res.status === 200) fn.apply(null, res.body.split(':'));
+      else {
+        self.connecting = false;
+        self.onError(new Error('Handshake failed: ' + res.status));
+      }
+    }, error => { self.connecting = false; self.onError(error); });
   };
 
   // 2. Replace WebSocket open to pass extraHeaders
@@ -92,6 +76,7 @@ class SocketManager {
     this.connected = false;
     this.events = new EventEmitter();
     this.documents = new Set();
+    this._handshakeAbort = null;
     this.events.setMaxListeners(0); // One subscription per document, removed on detach.
   }
 
@@ -103,9 +88,11 @@ class SocketManager {
 
       // Connect with v2 scheme (projectId in query) - used by overleaf.com
       const queryUrl = `${url}?projectId=${this.projectId}&t=${Date.now()}`;
+      this._handshakeAbort = new AbortController();
       this.socket = io.connect(queryUrl, {
         reconnect: false,
         'force new connection': true,
+        handshakeSignal: this._handshakeAbort.signal,
         extraHeaders: {
           'Cookie': this.cookie,
           'Origin': url,
@@ -407,6 +394,8 @@ class SocketManager {
 
   disconnect() {
     this._cancelConnect?.();
+    this._handshakeAbort?.abort();
+    this._handshakeAbort = null;
     if (this.connected) this.events.emit('interrupted', { reason: 'disconnect' });
     this.connected = false;
     if (this.socket) {

@@ -224,12 +224,19 @@ end
 
 local function setup_autocmds()
   local group = vim.api.nvim_create_augroup('OverleafNvim', { clear = false })
-  vim.api.nvim_clear_autocmds({ group = group, event = { 'ExitPre', 'VimLeavePre' } })
+  vim.api.nvim_clear_autocmds({ group = group, event = { 'ExitPre', 'VimLeavePre', 'FocusGained', 'VimResume' } })
   vim.api.nvim_create_autocmd({ 'ExitPre', 'VimLeavePre' }, {
     group = group,
     desc = 'Wipe Overleaf virtual buffers before sessions are saved',
     callback = function()
       if config.get().cleanup_buffers_on_exit ~= false then M.cleanup_buffers() end
+    end,
+  })
+  vim.api.nvim_create_autocmd({ 'FocusGained', 'VimResume' }, {
+    group = group,
+    desc = 'Retry an offline project when returning to the editor',
+    callback = function()
+      if not bridge._exiting and sync._workspace and not sync._workspace.closing then M._attempt_reconnect() end
     end,
   })
 end

@@ -56,9 +56,8 @@ class BridgeClient {
     this.buffer = '';
   }
 
-  start() {
+  start(bridgePath = path.join(__dirname, '..', '..', 'node', 'bridge.js')) {
     return new Promise((resolve, reject) => {
-      const bridgePath = path.join(__dirname, '..', '..', 'node', 'bridge.js');
       this.proc = spawn('node', [bridgePath], {
         env: {
           ...process.env,
@@ -329,6 +328,90 @@ async function runTests() {
     }
   });
 
+  await test('EOF closes recovery stores when a network request has no remaining event-loop handle', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'overleaf-rpc-no-handle-'));
+    const bootstrap = path.join(root, 'bridge.cjs');
+    const authPath = path.resolve(__dirname, '../../node/auth.js');
+    const bridgePath = path.resolve(__dirname, '../../node/bridge.js');
+    fs.writeFileSync(bootstrap, `require(${JSON.stringify(authPath)}).fetchProjectPage = () => new Promise(() => {});\nrequire(${JSON.stringify(bridgePath)});\n`);
+    const sourceRoot = path.join(root, 'sources');
+    fs.mkdirSync(sourceRoot);
+    const options = { root: path.join(root, 'state'), sourceRoot, server: 'https://example.test', projectId: 'project' };
+    const client = new BridgeClient(port);
+    await client.start(bootstrap);
+    try {
+      const { session } = await client.request('syncOpen', options);
+      await client.request('syncDocument', { session, document: 'doc', action: 'open', path: 'main.tex',
+        initial: { content: 'saved source', version: 1 } });
+      client.proc.stdin.write(JSON.stringify({ id: 99999, method: 'auth', params: { cookie: 'test' } }) + '\n');
+      await client.request('ping');
+      let timer;
+      const exit = new Promise((resolve, reject) => {
+        timer = setTimeout(() => reject(new Error('Bridge did not finish shutdown')), 8000);
+        client.proc.once('exit', code => { clearTimeout(timer); resolve(code); });
+      });
+      client.proc.stdin.end();
+      assertEqual(await exit, 0);
+      const { SyncSession } = require('../../node/sync/session');
+      const reopened = await SyncSession.open(options);
+      try {
+        const restored = await reopened.document({ document: 'doc', action: 'open', path: 'main.tex' });
+        assertEqual(restored.state.saved, 'saved source');
+        assertEqual(fs.readFileSync(path.join(sourceRoot, 'main.tex'), 'utf8'), 'saved source');
+      } finally { await reopened.close(); }
+    } finally {
+      client.stop();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  await test('shutdown abandons an upload-review join while releasing its local stores', async () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'overleaf-review-exit-')));
+    const sourceRoot = path.join(root, 'sources'); fs.mkdirSync(sourceRoot);
+    const bootstrap = path.join(root, 'bridge.cjs'), marker = path.join(root, 'joining');
+    const socketPath = path.resolve(__dirname, '../../node/socket.js');
+    const bridgePath = path.resolve(__dirname, '../../node/bridge.js');
+    fs.writeFileSync(bootstrap, `
+const SocketManager = require(${JSON.stringify(socketPath)});
+const join = SocketManager.prototype.joinDoc;
+let joined = false;
+SocketManager.prototype.joinDoc = function (...args) {
+  if (joined) {
+    require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'joining');
+    return new Promise(() => {});
+  }
+  joined = true;
+  return join.apply(this, args);
+};
+require(${JSON.stringify(bridgePath)});
+`);
+    const client = new BridgeClient(port), document = 'review-exit';
+    const options = { root: path.join(root, 'state'), sourceRoot, server: `http://127.0.0.1:${port}`, projectId: 'test_project' };
+    getOrCreateDoc(document, ['saved source']);
+    await client.start(bootstrap);
+    try {
+      await client.request('connect', { cookie: 'test', projectId: 'test_project' });
+      const { session } = await client.request('syncOpen', options);
+      await client.request('syncDocument', { session, document, action: 'open', path: 'main.tex', initial: { content: 'saved source', version: 0 } });
+      await client.request('syncConnect', { session, document });
+      client.proc.stdin.write(JSON.stringify({ id: 99999, method: 'syncUploadReview', params: { session, document } }) + '\n');
+      for (let count = 0; count < 200 && !fs.existsSync(marker); count++) await new Promise(resolve => setTimeout(resolve, 10));
+      assert(fs.existsSync(marker), 'The join must be waiting before EOF');
+      let timer;
+      const exit = new Promise((resolve, reject) => {
+        timer = setTimeout(() => reject(new Error('Upload-review network join prevented shutdown')), 8000);
+        client.proc.once('exit', code => { clearTimeout(timer); resolve(code); });
+      });
+      client.proc.stdin.end();
+      assertEqual(await exit, 0);
+      const { SyncSession } = require('../../node/sync/session');
+      const reopened = await SyncSession.open(options);
+      try {
+        assertEqual((await reopened.document({ document, action: 'open', path: 'main.tex' })).state.saved, 'saved source');
+      } finally { await reopened.close(); }
+    } finally { client.stop(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
   await test('connect to mock server', async () => {
     // The connect handler needs a cookie, but our mock doesn't validate
     // We need to bypass the auth.updateCookies call — use a special flag
@@ -431,6 +514,68 @@ async function runTests() {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+
+  for (const phase of ['network', 'local checkpoint']) {
+  await test(`shutdown preserves a comment draft while draining its ${phase} phase`, async () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'overleaf-comment-exit-')));
+    const sourceRoot = path.join(root, 'sources'); fs.mkdirSync(sourceRoot);
+    const client = new BridgeClient(port), document = 'comment-exit-' + phase;
+    const thread = 'thread-' + phase, base = 'saved source';
+    getOrCreateDoc(document, [base]);
+    const options = { root: path.join(root, 'state'), sourceRoot, server: `http://127.0.0.1:${port}`, projectId: 'test_project' };
+    const bootstrap = path.join(root, 'bridge.cjs'), marker = path.join(root, 'accepted');
+    const bridgePath = path.resolve(__dirname, '../../node/bridge.js');
+    const storePath = path.resolve(__dirname, '../../node/sync/store.js');
+    fs.writeFileSync(bootstrap, `
+const { SnapshotStore } = require(${JSON.stringify(storePath)});
+const write = SnapshotStore.prototype.write;
+SnapshotStore.prototype.write = async function (...args) {
+  if (${JSON.stringify(phase)} === 'local checkpoint' && args[1].comments?.some(draft => draft.thread === ${JSON.stringify(thread)})) {
+    require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'accepted');
+    await new Promise(resolve => setTimeout(resolve, 6000));
+  }
+  return write.apply(this, args);
+};
+require(${JSON.stringify(bridgePath)});
+`);
+    await client.start(bootstrap);
+    try {
+      await client.request('connect', { cookie: 'test', projectId: 'test_project' });
+      const { session } = await client.request('syncOpen', options);
+      await client.request('syncDocument', { session, document, action: 'open', path: 'main.tex', initial: { content: base, version: 0 } });
+      await client.request('syncConnect', { session, document });
+      client.proc.stdin.write(JSON.stringify({ id: 99999, method: 'syncComment', params: {
+        session, document, cookie: 'test', csrfToken: 'test', selection: {
+          thread, message: 'STALL COMMENT RESPONSE', view: base, start: { row: 0, col: 0 }, end: { row: 0, col: 5 },
+        },
+      } }) + '\n');
+      for (let count = 0; count < 200; count++) {
+        if (phase === 'network' ? srv.commentPosts.some(post => post.thread === thread) : fs.existsSync(marker)) break;
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      assert(phase === 'network' ? srv.commentPosts.some(post => post.thread === thread) : fs.existsSync(marker), 'The tested phase must be accepted before EOF');
+      let timer;
+      const exit = new Promise((resolve, reject) => {
+        timer = setTimeout(() => reject(new Error('Network phase prevented shutdown')), 9000);
+        client.proc.once('exit', code => { clearTimeout(timer); resolve(code); });
+      });
+      client.proc.stdin.end();
+      assertEqual(await exit, 0);
+      const { SyncSession } = require('../../node/sync/session');
+      const reopened = await SyncSession.open(options);
+      try {
+        const record = (await reopened.document({ document, action: 'open', path: 'main.tex' })).state;
+        const snapshot = (await reopened.document({ document, action: 'snapshot' })).result;
+        assertEqual(record.saved, base);
+        assertEqual(snapshot.comments.length, 1);
+        assertEqual(snapshot.comments[0].thread, thread);
+        assertEqual(snapshot.comments[0].posted, false);
+        assertEqual(fs.readFileSync(path.join(sourceRoot, 'main.tex'), 'utf8'), base);
+        if (phase === 'local checkpoint') assert(!srv.commentPosts.some(post => post.thread === thread), 'No network write may start after shutdown has abandoned network work');
+      } finally { await reopened.close(); }
+    } finally { client.stop(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+  }
 
   for (const format of [{ fileformat: 'unix', bomb: false }, { fileformat: 'dos', bomb: true }]) {
   await test(`guarded ${format.fileformat} workspace saves reach the server through confirmed transport and reject legacy writes`, async () => {

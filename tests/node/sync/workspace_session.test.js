@@ -21,6 +21,48 @@ const checkpoint = contents => ({
   options: { fileformat: 'unix', fileencoding: '', endofline: false, fixendofline: false, bomb: false, binary: false, undolevels: 1000 },
 });
 
+test('native quit drains large accepted replies without hanging or retaining recovery locks', async t => {
+  const directory = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'overleaf-output-exit-')));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const sourceRoot = path.join(directory, 'sources'); await fs.mkdir(sourceRoot);
+  const content = base.repeat(10000);
+  await fs.writeFile(path.join(sourceRoot, 'main.tex'), content);
+  const options = { root: path.join(directory, 'state'), sourceRoot, server: 'https://example.test', projectId: 'project' };
+  const scriptPath = path.join(directory, 'exit.lua');
+  await fs.writeFile(scriptPath, `
+vim.opt.rtp:append(vim.fn.getcwd())
+local bridge = require('overleaf.bridge')
+local function rpc(method, params)
+  local done, failure, reply = false
+  bridge.request(method, params, function(err, value) failure, reply, done = err, value, true end)
+  assert(vim.wait(5000, function() return done end), method .. ' timed out')
+  assert(not failure, vim.inspect(failure))
+  return reply
+end
+local started = false
+bridge.start(function(err) assert(not err, vim.inspect(err)); started = true end)
+assert(vim.wait(5000, function() return started end))
+local options = vim.json.decode(${JSON.stringify(JSON.stringify(options))})
+local session = rpc('syncOpen', options)
+local content = table.concat(vim.fn.readfile(options.sourceRoot .. '/main.tex', 'b'), '\\n')
+rpc('syncDocument', {session=session.session, document='doc', action='open', path='main.tex', initial={content=content, version=1}})
+for _=1,8 do
+  bridge.request('syncDocument', {session=session.session, document='doc', action='snapshot'}, function()
+    error('A reply resumed editor work during exit')
+  end)
+end
+vim.cmd('q')
+`);
+  await promisify(execFile)('nvim', ['--headless', '--noplugin', '-u', 'NONE', '-i', 'NONE', '-l', scriptPath], {
+    cwd: path.resolve(__dirname, '../../..'), timeout: 15000,
+  });
+  const reopened = await SyncSession.open(options);
+  try {
+    assert.equal((await reopened.document({ document: 'doc', action: 'open', path: 'main.tex' })).state.saved, content);
+    assert.equal(await fs.readFile(path.join(sourceRoot, 'main.tex'), 'utf8'), content);
+  } finally { await reopened.close(); }
+});
+
 for (const [command, mode, count] of [
   ['x', 'edited', 1], ['wq', 'edited', 1], ['wqall', 'edited', 2],
   ['x', 'clean', 1], ['wq', 'clean', 1],

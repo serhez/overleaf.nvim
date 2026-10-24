@@ -126,7 +126,7 @@ class MockClient {
 
   handlePacket(packet) {
     if (packet.type === 'heartbeat') {
-      this.send('2::');
+      // The client echoes server heartbeats; echoing them again creates a loop.
       return;
     }
 
@@ -289,6 +289,13 @@ function createServer(port) {
         commentPosts.push({ thread: comment[1], ...message });
         (threads[comment[1]] ??= { messages: [] }).messages.push(message);
         if (message.content === 'LOSE COMMENT RESPONSE') { res.destroy(); return; }
+        if (message.content === 'STALL COMMENT RESPONSE') {
+          res.writeHead(201, { 'Content-Type': 'application/json' });
+          res.write('{');
+          const timer = setInterval(() => res.write(' '), 250);
+          res.once('close', () => clearInterval(timer));
+          return;
+        }
         res.writeHead(201, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(message));
       });
       return;
@@ -426,6 +433,8 @@ function createServer(port) {
     wss.handleUpgrade(req, socket, head, (ws) => {
       const client = new MockClient(ws, session.projectId);
       clients.add(client);
+      const heartbeat = setInterval(() => client.send('2::'), 5000);
+      ws.once('close', () => clearInterval(heartbeat));
 
       // Send connect packet
       ws.send('1::');

@@ -131,7 +131,7 @@ vim.api.nvim_create_autocmd('VimLeavePre', {
       if result >= 0 or result == -3 then break end
       if M._job_id == job and not reported then
         reported = true
-        pcall(vim.notify, '[overleaf] Waiting for recovery writes before exit...', vim.log.levels.INFO)
+        pcall(vim.notify, '[overleaf] Waiting for bridge shutdown before exit...', vim.log.levels.INFO)
       end
     end
   end,
